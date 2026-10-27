@@ -1,0 +1,45 @@
+{
+  "name": "dsh-work-chain",
+  "version": "0.6.0",
+  "private": true,
+  "description": "Work-chain workflow for DeepSeek Harness: the current session is the leader; configurable members (each with its own model) work the task in parallel as real Agent Teams teammates and report through the built-in team task board. Member provider/model are picked from dropdowns populated by the live DSH provider catalog, defaulting to deepseek-v4.1-flash. Also ships an aesthetic advisor (v0.6.0): a leader-only aesthetic_advice tool that hands a delivered artifact (UI file, screenshot, URL or description) to a disposable reviewer subagent for ranked visual/UI critique — advice only, it never edits files — with its enable switch, model and style notes configurable on the same plugin page.",
+  "type": "module",
+  "main": "index.js",
+  "icon": "./icon.svg",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "agent-team",
+    "workflow",
+    "work-chain",
+    "multi-model"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "license": "MIT"
+}

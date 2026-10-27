@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "工作链",
+    "description": "当前会话当 leader；成员 provider/model 从 DSH 已配置的供应商下拉选择（默认 deepseek-v4.1-flash），按配置并行完成后再用内置团队任务板汇总。另含 leader 专用「审美顾问」（aesthetic_advice）：独立评审界面/视觉，只给建议不改文件。"
+  }
+}

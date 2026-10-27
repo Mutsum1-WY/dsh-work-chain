@@ -1,0 +1,12 @@
+# dsh-work-chain bundle layer.
+#
+# Installed as a third-party DSH bundle: package.json declares
+# `dsh.bundle.patch`, so plugin_manager install_bundle / `dsh plugin add`
+# applies this layer without hand-editing the profile.
+#
+# One host row registers the `work_chain` tool (leader side) plus the
+# plugin-page configuration route; the Web UI half lives in ./client.js and is
+# declared through `dsh.client` in package.json.
+- insert:
+    - id: work-chain
+      name: dsh-work-chain
