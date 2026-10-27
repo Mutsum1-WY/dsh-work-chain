@@ -8,6 +8,9 @@
 // 文本），与宿主半的 config.aesthetic 对应；leader 用 aesthetic_advice 工具征询审美建议，
 // 建议只回给 leader，由 leader 决定是否采纳。
 //
+// v0.7.0：移除 rotate（一次性子代理轮换）模式，只保留 team 模式（常驻 Agent Teams
+// 队友）；配置卡片不再有「成员模式」选择，config 里的 mode 字段也不再使用。
+//
 // 客户端模块系统（window.__ModuleLoader__）只登记 factory，物化时才执行闭包；factory
 // 返回 { apply, inject }，内核把它当客户端插件挂载。浏览器模块 id 必须等于包名。
 //
@@ -114,25 +117,16 @@ window.__ModuleLoader__.load({
       return `${base}-${Date.now()}`;
     }
     /**
-     * 输入范围：与宿主半 index.js（v0.2.0）对齐。
-     * - members：rotate 模式固定最多 16（host 轮换一次最多跑 16 个）；team 模式的
-     *   实际上限来自 GET team.maxMembers（设置里的智能体上限，最高 64），缺失回退 8；
-     * - maxParallel 宿主固定 1~8（rotate 每批 = maxParallel，最多 8）；
+     * 输入范围：与宿主半 index.js 对齐。
+     * - members：实际上限来自 GET team.maxMembers（设置里的智能体上限，最高 64），缺失回退 8；
+     * - maxParallel 宿主固定 1~8（work_flow 每轮默认派活数）；
      * - timeoutSeconds 宿主是 30~3600。
      */
     const LIMITS = Object.freeze({
-      members: Object.freeze({ min: 1, max: 64, fallback: 8, rotateMax: 16 }),
+      members: Object.freeze({ min: 1, max: 64, fallback: 8 }),
       maxParallel: Object.freeze({ min: 1, max: 8, fallback: 4 }),
       timeoutSeconds: Object.freeze({ min: 30, max: 3600, fallback: 600 }),
     });
-    /** 成员模式：rotate = 一次性子代理轮换（默认）；team = 常驻 Agent Teams 队友。 */
-    const MODES = Object.freeze(['rotate', 'team']);
-    const DEFAULT_MODE = 'rotate';
-
-    /** 非 team 一律当 rotate（与宿主 normalizeConfig 一致）。 */
-    function normalizeMode(value) {
-      return value === 'team' ? 'team' : DEFAULT_MODE;
-    }
 
     /**
      * 规范化宿主 catalog：{available,groups:[{id,name,models:[{id,name}]}],failures,defaultProvider,defaultModel}。
@@ -392,24 +386,6 @@ window.__ModuleLoader__.load({
         color: COLOR.muted,
       },
       capacityValue: { color: COLOR.text },
-      modeGroup: { display: 'grid', gap: 8 },
-      modeOption: {
-        display: 'grid',
-        gridTemplateColumns: 'auto minmax(0, 1fr)',
-        alignItems: 'start',
-        gap: 8,
-        padding: '8px 10px',
-        border: `0.5px solid ${COLOR.border}`,
-        borderRadius: 'var(--dsw-radius-md, 8px)',
-      },
-      modeOptionActive: {
-        border: `0.5px solid ${COLOR.accent}`,
-        background: COLOR.layer,
-      },
-      modeRadio: {
-        marginTop: 2,
-        accentColor: COLOR.accent,
-      },
       checkRow: {
         display: 'flex',
         alignItems: 'flex-start',
@@ -420,9 +396,6 @@ window.__ModuleLoader__.load({
         marginTop: 2,
         accentColor: COLOR.accent,
       },
-      modeOptionBody: { display: 'flex', flexDirection: 'column', gap: 2 },
-      modeOptionTitle: { fontSize: 12.5, fontWeight: 600 },
-      modeOptionText: { fontSize: 11.5, color: COLOR.muted },
       failedBox: {
         display: 'flex',
         flexDirection: 'column',
@@ -492,14 +465,6 @@ window.__ModuleLoader__.load({
         '智能体上限（设置）{maxMembers}（来源 {limitSource}）· 已用 {usedMembers} · 剩余可新建 {remainingSlots}',
       reuseHint:
         '已有成员会被复用（同名），槽位不足时该成员会被跳过并报告；新开一个对话即可重置智能体槽位。',
-      modeTitle: '成员模式',
-      modeHint: '保存后随配置生效；work_chain 调用时也可用 mode 参数临时覆盖。',
-      modeRotateTitle: '轮换（rotate，推荐）',
-      modeRotateText: '每个成员一次性子代理，跑完即释放，不受智能体上限限制（推荐）',
-      modeTeamTitle: '团队（team）',
-      modeTeamText: '成员作为常驻 Agent Teams 队友，跨调用复用，受设置里智能体上限限制',
-      rotateCapacity:
-        '轮换模式不受智能体上限限制；最多 {max} 个成员（每批 min(maxParallel, 8) 个，跑完即释放）。',
       workflowLabel: '工作流',
       workflowTitle: '工作流模式：开启后本对话默认用 work_flow 调度成员并逐轮验收',
       workflowLoading: '工作流模式：正在读取…',
@@ -531,9 +496,9 @@ window.__ModuleLoader__.load({
       modelPlaceholder: '输入或从建议中选择',
       emptyMembers: '还没有成员，点「添加成员」开始配置。',
       parallelTitle: '运行参数',
-      parallelHint: '保存后下一次 work_chain 调用生效；成员名和模型用于给成员锁定模型。',
+      parallelHint: '保存后下一次 work_chain / work_flow 调用生效；成员名和模型用于给成员锁定模型。',
       maxParallel: '最大并行数',
-      maxParallelHint: '1~{max}，同时运行的成员任务上限',
+      maxParallelHint: '1~{max}，work_flow 每轮默认派活的成员数',
       timeoutSeconds: '超时（秒）',
       timeoutSecondsHint: '30~3600，单个成员任务的超时时间',
       aestheticTitle: '审美顾问',
@@ -568,8 +533,6 @@ window.__ModuleLoader__.load({
       invalidMembersEmpty: '至少需要一个成员',
       invalidMembersTooMany: '成员超过上限 {max} 个',
       memberLimitReached: '设置里的智能体上限是 {max}，请到设置调大或删行。',
-      rotateMemberLimitReached:
-        '轮换模式最多 {max} 个成员（每批 min(maxParallel, 8) 个，跑完即释放），请删行。',
       invalidNameEmpty: '成员名不能为空',
       invalidNameFormat: '成员名需为小写 kebab-case 且 ≤64 字符（例如 deepseek-v4-1-flash）',
       invalidNameDuplicate: '成员名重复',
@@ -590,14 +553,6 @@ window.__ModuleLoader__.load({
         'Agent limit (settings) {maxMembers} (source {limitSource}) · used {usedMembers} · {remainingSlots} slots free',
       reuseHint:
         'Existing members are reused by name; when slots run short that member is skipped and reported — start a new conversation to reset agent slots.',
-      modeTitle: 'Member mode',
-      modeHint: 'Saved with the configuration; a work_chain call may override it with its mode argument.',
-      modeRotateTitle: 'Rotate (default, recommended)',
-      modeRotateText: 'One disposable subagent per member, released as soon as its task finishes; not limited by the agent limit (recommended)',
-      modeTeamTitle: 'Team',
-      modeTeamText: 'Members stay as durable Agent Teams teammates, reused across calls, limited by the agent limit in settings',
-      rotateCapacity:
-        'Rotate mode is not limited by the agent limit; up to {max} members (each wave runs min(maxParallel, 8) and releases them when done).',
       workflowLabel: 'Workflow',
       workflowTitle:
         'Workflow mode: when on, this conversation schedules members with work_flow and reviews each round',
@@ -630,9 +585,9 @@ window.__ModuleLoader__.load({
       modelPlaceholder: 'Type or pick a suggestion',
       emptyMembers: 'No members yet. Use "Add member" to start.',
       parallelTitle: 'Runtime',
-      parallelHint: 'Takes effect on the next work_chain call; names and models pin each member’s model.',
+      parallelHint: 'Takes effect on the next work_chain / work_flow call; names and models pin each member’s model.',
       maxParallel: 'Max parallel',
-      maxParallelHint: '1–{max}, how many member tasks run at once',
+      maxParallelHint: '1–{max}, default number of members dispatched per work_flow round',
       timeoutSeconds: 'Timeout (s)',
       timeoutSecondsHint: '30–3600, budget for one member task',
       aestheticTitle: 'Aesthetic advisor',
@@ -669,8 +624,6 @@ window.__ModuleLoader__.load({
       invalidMembersEmpty: 'At least one member is required',
       invalidMembersTooMany: 'Too many members (limit {max})',
       memberLimitReached: 'The agent limit in settings is {max}; raise it there or remove rows.',
-      rotateMemberLimitReached:
-        'Rotate mode supports up to {max} members (each wave runs min(maxParallel, 8) and releases them when done); remove rows.',
       invalidNameEmpty: 'A member name is required',
       invalidNameFormat: 'Use a lower-kebab-case name of at most 64 characters (e.g. deepseek-v4-1-flash)',
       invalidNameDuplicate: 'Duplicate member name',
@@ -921,18 +874,10 @@ window.__ModuleLoader__.load({
       } else {
         warnings.push('timeoutSeconds');
       }
-      const mode = normalizeMode(source.mode);
-      if (source.mode !== undefined && source.mode !== 'rotate' && source.mode !== 'team') {
-        warnings.push('mode');
-      }
       const defaults = isRecord(payload.defaults) ? payload.defaults : {};
       const models = Array.isArray(defaults.models)
         ? defaults.models.filter((entry) => typeof entry === 'string' && entry.trim() !== '')
         : [];
-      const declaredModes = Array.isArray(defaults.modes)
-        ? defaults.modes.filter((entry) => MODES.includes(entry))
-        : [];
-      const modes = declaredModes.length > 0 ? [...new Set(declaredModes)] : MODES.slice();
       const defaultMembers = Array.isArray(defaults.members)
         ? defaults.members.map(normalizeMemberRecord).filter((entry) => entry !== null)
         : [];
@@ -953,13 +898,11 @@ window.__ModuleLoader__.load({
         ok: true,
         config: {
           members,
-          mode,
           maxParallel,
           timeoutSeconds,
           aesthetic: normalizeAestheticDraft(source.aesthetic),
         },
         models,
-        modes,
         catalog,
         team:
           team ?? {
@@ -1051,7 +994,6 @@ window.__ModuleLoader__.load({
         : [];
       return {
         members,
-        mode: normalizeMode(config.mode),
         maxParallel: String(clampInteger(config.maxParallel, LIMITS.maxParallel.fallback, LIMITS.maxParallel.min, LIMITS.maxParallel.max)),
         timeoutSeconds: String(
           clampInteger(config.timeoutSeconds, LIMITS.timeoutSeconds.fallback, LIMITS.timeoutSeconds.min, LIMITS.timeoutSeconds.max),
@@ -1068,7 +1010,6 @@ window.__ModuleLoader__.load({
           provider: String(member.provider).trim(),
           model: String(member.model).trim(),
         })),
-        mode: normalizeMode(draft.mode),
         maxParallel: Number(draft.maxParallel),
         timeoutSeconds: Number(draft.timeoutSeconds),
         aesthetic: {
@@ -1446,7 +1387,6 @@ window.__ModuleLoader__.load({
       const [draft, setDraft] = React.useState(null);
       const [meta, setMeta] = React.useState({
         catalog: synthesizeCatalog([], [], MODEL_SUGGESTIONS),
-        modes: MODES.slice(),
         team: {
           available: true,
           maxMembers: null,
@@ -1499,7 +1439,6 @@ window.__ModuleLoader__.load({
           setDraft(toDraft(parsed.config));
           setMeta({
             catalog: parsed.catalog,
-            modes: parsed.modes.length > 0 ? parsed.modes : MODES.slice(),
             team: parsed.team,
           });
           setPhase({
@@ -1652,19 +1591,13 @@ window.__ModuleLoader__.load({
         setNotice({ seq: Date.now(), text: noticeText });
       };
 
-      // 成员行数上限按模式区分：rotate = 16（host 轮换一次最多跑 16 个，不再看设置上限）；
-      // team = 设置里实际生效的智能体上限（team.maxMembers，缺失回退 8）。
+      // 成员行数上限 = 设置里实际生效的智能体上限（team.maxMembers，缺失回退 8）。
       // host v0.2.0 的 maxParallel 固定 1~8，不跟随智能体上限。
-      const mode = draft === null ? DEFAULT_MODE : normalizeMode(draft.mode);
       const memberLimit =
-        mode === 'rotate'
-          ? LIMITS.members.rotateMax
-          : typeof meta.team.maxMembers === 'number' && meta.team.maxMembers >= LIMITS.members.min
-            ? Math.min(meta.team.maxMembers, LIMITS.members.max)
-            : LIMITS.members.fallback;
+        typeof meta.team.maxMembers === 'number' && meta.team.maxMembers >= LIMITS.members.min
+          ? Math.min(meta.team.maxMembers, LIMITS.members.max)
+          : LIMITS.members.fallback;
       const maxParallelLimit = LIMITS.maxParallel.max;
-      const memberLimitMessageKey =
-        mode === 'rotate' ? 'rotateMemberLimitReached' : 'memberLimitReached';
       const loading = phase.status === 'loading';
       const ready = phase.status === 'ready';
       const busy = loading || saving;
@@ -1715,76 +1648,22 @@ window.__ModuleLoader__.load({
       const atMemberLimit = draft.members.length >= memberLimit;
       const team = meta.team;
       const showCapacity = team.maxMembers !== null || team.usedMembers !== null;
-      const availableModes = meta.modes.length > 0 ? meta.modes : MODES.slice();
-      const modeOptions = [
-        { value: 'rotate', titleKey: 'modeRotateTitle', textKey: 'modeRotateText' },
-        { value: 'team', titleKey: 'modeTeamTitle', textKey: 'modeTeamText' },
-      ].filter((option) => availableModes.includes(option.value));
 
       return h(
         'div',
         { style: STYLE.root, 'data-work-chain-config': true },
         h(LeaderNotice, { t }),
-        h(
-          'div',
-          { style: { display: 'flex', flexDirection: 'column', gap: 6 } },
-          h(
-            'div',
-            { style: STYLE.sectionHead },
-            h('div', { style: STYLE.sectionTitle }, t('modeTitle')),
-            h('span', { style: STYLE.sectionMeta }, t('modeHint')),
-          ),
-          h(
-            'div',
-            { style: STYLE.modeGroup, role: 'radiogroup', 'aria-label': t('modeTitle'), 'data-work-chain-mode': mode },
-            modeOptions.map((option) =>
-              h(
-                'label',
-                {
-                  key: option.value,
-                  style:
-                    mode === option.value
-                      ? { ...STYLE.modeOption, ...STYLE.modeOptionActive }
-                      : STYLE.modeOption,
-                },
-                h('input', {
-                  type: 'radio',
-                  name: 'work-chain-member-mode',
-                  value: option.value,
-                  checked: mode === option.value,
-                  disabled: saving,
-                  style: STYLE.modeRadio,
-                  onChange: () => {
-                    updateDraft((previous) => ({ ...previous, mode: option.value }));
-                  },
-                }),
-                h(
-                  'span',
-                  { style: STYLE.modeOptionBody },
-                  h('span', { style: STYLE.modeOptionTitle }, t(option.titleKey)),
-                  h('span', { style: STYLE.modeOptionText }, t(option.textKey)),
-                ),
-              ),
-            ),
-          ),
-        ),
-        mode === 'rotate'
+        showCapacity
           ? h(
               'div',
-              { style: STYLE.capacity, 'data-work-chain-rotate': true, role: 'status' },
-              h('span', { style: STYLE.capacityValue }, t('rotateCapacity', { max: String(memberLimit) })),
+              { style: STYLE.capacity, 'data-work-chain-capacity': true, role: 'status' },
+              h('span', { style: STYLE.capacityValue }, capacityText(t, team)),
             )
-          : showCapacity
-            ? h(
-                'div',
-                { style: STYLE.capacity, 'data-work-chain-capacity': true, role: 'status' },
-                h('span', { style: STYLE.capacityValue }, capacityText(t, team)),
-              )
-            : null,
-        mode === 'team' && team.available !== true
+          : null,
+        team.available !== true
           ? h('div', { style: STYLE.warnBox, role: 'status' }, t('teamUnavailable'))
           : null,
-        mode === 'team' && typeof team.usedMembers === 'number' && team.usedMembers > 0
+        typeof team.usedMembers === 'number' && team.usedMembers > 0
           ? h('div', { style: STYLE.hint }, t('reuseHint'))
           : null,
         h(
@@ -1870,15 +1749,13 @@ window.__ModuleLoader__.load({
             ? h(
                 'span',
                 { style: STYLE.error, role: 'status' },
-                t(mode === 'rotate' ? 'rotateMemberLimitReached' : 'invalidMembersTooMany', {
-                  max: String(memberLimit),
-                }),
+                t('invalidMembersTooMany', { max: String(memberLimit) }),
               )
             : atMemberLimit
               ? h(
                   'span',
                   { style: STYLE.error, role: 'status' },
-                  t(memberLimitMessageKey, { max: String(memberLimit) }),
+                  t('memberLimitReached', { max: String(memberLimit) }),
                 )
               : null,
         ),
@@ -2115,7 +1992,6 @@ window.__ModuleLoader__.load({
       DEFAULT_MODEL,
       capacityText,
       sameTeam,
-      normalizeMode,
       modelMemberName,
       isAutoMemberName,
       nextMemberNameForModel,

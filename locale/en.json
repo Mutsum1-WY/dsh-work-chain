@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Work Chain",
-    "description": "Keep the current session as leader; pick each member's provider/model from dropdowns populated by the DSH provider catalog (default deepseek-v4.1-flash), and member names default to the model name (duplicates get -2/-3). Run the fan-out and collect results through the built-in team task board. Also ships a leader-only Aesthetic Advisor (aesthetic_advice) that reviews UI/visual quality and only gives advice — it never edits files."
+    "description": "Keep the current session as leader; members are durable Agent Teams teammates (team mode only), with provider/model picked from the DSH provider catalog (default deepseek-v4.1-flash) and names defaulting to the model name (duplicates get -2/-3). Run the fan-out and collect results through the built-in team task board. Also ships a leader-only Aesthetic Advisor (aesthetic_advice) that reviews UI/visual quality and only gives advice — it never edits files."
   }
 }

@@ -192,7 +192,6 @@ function normalizeAesthetic(input) {
 function defaultConfig() {
   return {
     members: defaultMembers(),
-    mode: 'rotate',
     workflowMode: false,
     maxParallel: 4,
     timeoutSeconds: 600,
@@ -201,12 +200,11 @@ function defaultConfig() {
   }
 }
 
-/** 校验整份配置（GUI POST 与工具共用）。成员数量上限 64；team 模式的实际可用数在调用时按设置上限裁。 */
+/** 校验整份配置（GUI POST 与工具共用）。成员数量上限 64；实际可用数在调用时按设置里的智能体上限裁。 */
 function normalizeConfig(input) {
   const source = input !== null && typeof input === 'object' ? input : {}
   return {
     members: normalizeMembers(source.members ?? DEFAULT_MEMBERS),
-    mode: source.mode === 'team' ? 'team' : 'rotate',
     workflowMode: source.workflowMode === true,
     maxParallel: clampInteger(source.maxParallel, 4, 1, 8),
     timeoutSeconds: clampInteger(source.timeoutSeconds, 600, 30, 3600),
@@ -235,7 +233,7 @@ function migrateMemberNames(config) {
   return { ...config, members, namingVersion: CONFIG_NAMING_VERSION }
 }
 
-/** 读取有效配置；旧版别名成员名在读取时迁移成模型名。team 模式的成员数在调用时按当前智能体上限截断。 */
+/** 读取有效配置；旧版别名成员名在读取时迁移成模型名。成员数在调用时按当前智能体上限截断。 */
 function readConfig() {
   try {
     const text = fs.readFileSync(configFile(), 'utf8')
@@ -593,7 +591,6 @@ function installConfigRoute(ctx) {
             defaults: {
               members: DEFAULT_MEMBERS.map((member) => ({ ...member })),
               models: GO_MODELS,
-              modes: ['rotate', 'team'],
               provider: catalog.defaultProvider,
               model: catalog.defaultModel,
               aesthetic: { ...defaultAesthetic(), provider: catalog.defaultProvider, model: catalog.defaultModel },
@@ -607,7 +604,7 @@ function installConfigRoute(ctx) {
           const body = await readJsonBody(req)
           const current = readConfig()
           const incoming = body?.config !== null && typeof body?.config === 'object' ? body.config : {}
-          // 保存成员/模式等配置时保留「工作流模式」开关与命名版本（配置页不一定提交这两个字段）。
+          // 保存成员等配置时保留「工作流模式」开关与命名版本（配置页不一定提交这两个字段）。
           const config = normalizeConfig({
             ...incoming,
             // 客户端不提交 namingVersion：始终保留当前（已迁移）版本，避免被旧客户端降回 1。
@@ -691,10 +688,9 @@ function readResultFile(file) {
 }
 
 function formatToolOutput(value) {
-  const mode = value.mode ?? value.team?.mode ?? 'team'
   const lines = [
     `# work_chain ${value.timedOut ? '（超时，部分结果）' : '完成'}`,
-    `run: ${value.runId} | 模式: ${mode}${mode === 'rotate' && value.team?.waveSize !== undefined ? `（每批 ${value.team.waveSize} 个，跑完即释放）` : ''} | leader: ${value.leader.provider}/${value.leader.model} | 成员 ${value.members.length} 个 | 用时 ${Math.round(value.elapsedMs / 1000)}s`,
+    `run: ${value.runId} | leader: ${value.leader.provider}/${value.leader.model} | 成员 ${value.members.length} 个 | 用时 ${Math.round(value.elapsedMs / 1000)}s`,
   ]
   if (value.team !== undefined) {
     lines.push(
@@ -710,7 +706,7 @@ function formatToolOutput(value) {
         ? '（实际请求模型未读到）'
         : `（实际请求：${member.actualProvider}/${member.actualModel}）`
     lines.push(`## ${member.name}（${member.provider}/${member.model}）${actual}`)
-    lines.push(`任务板：${member.taskId} · 状态：${member.taskStatus}${member.fileFound ? ` · 结果文件：${member.file}` : ' · 结果文件缺失'}${member.error === undefined ? '' : ` · 派活错误：${member.error}`}${member.warning === undefined ? '' : ` · 注意：${member.warning}`}`)
+    lines.push(`任务板：${member.taskId} · 状态：${member.taskStatus}${member.fileFound ? ` · 结果文件：${member.file}` : ' · 结果文件缺失'}${member.error === undefined ? '' : ` · 派活错误：${member.error}`}`)
     lines.push('')
     if (member.summary !== undefined && member.summary.length > 0) {
       lines.push(`任务板摘要${member.summarySource === 'file' ? '（任务板未更新，取自结果文件）' : ''}：`)
@@ -725,28 +721,6 @@ function formatToolOutput(value) {
   }
   lines.push('请基于以上成员结果完成最终汇总/核验；完整文件在 `.workchain/<runId>/` 目录。')
   return lines.join('\n')
-}
-
-/** 轮换模式（rotate）的成员提示：每个成员是一个一次性子代理，只负责写结果文件。 */
-function buildRotatingPrompt(options) {
-  const { task, subtask, member, runId, resultFile } = options
-  return [
-    `你是「工作链」成员 ${member.name}（模型 ${member.model}）。这是一次性任务：完成后你会被释放，不会再被复用。`,
-    '',
-    '## 总任务',
-    escapeTaskText(task, 5000),
-    '',
-    '## 你负责的分工',
-    escapeTaskText(subtask, 6000),
-    '',
-    '## 交付要求',
-    `1. 把完整结果（Markdown）写到文件：${resultFile}（目录不存在请先创建）。内容自包含：结论、依据/链接、代码或步骤、风险与未决问题。`,
-    '2. 最后一条回复用 3~5 行总结你的结论，不要复述全文。',
-    '3. 如果无法完成，也同样把原因写进结果文件并在回复里说明。',
-    '',
-    '不要调用 work_chain、spawn_teammate、team_task_* 或 send_message（你不在团队里，这些工具不可用/不该用）。',
-    `run id：${runId}`,
-  ].join('\n')
 }
 
 /**
@@ -828,119 +802,6 @@ function blocksToText(blocks) {
     .filter((block) => block !== null && typeof block === 'object' && block.type === 'text' && typeof block.text === 'string')
     .map((block) => block.text)
     .join('\n')
-}
-
-/** 轮换模式：把成员按 wave 分批拉到一次性子代理里跑，每批完成后立刻释放（相当于删掉再建下一个）。 */
-async function runRotatingMembers(options) {
-  const { ctx, agentTeams, lead, plans, waveSize, timeoutSeconds, signal } = options
-  const subagents = ctx.get('subagents')
-  if (subagents === undefined || subagents === null) throw new Error('work_chain 轮换模式需要 subagents 服务')
-  const deadline = Date.now() + timeoutSeconds * 1000
-  const results = []
-  for (let start = 0; start < plans.length; start += waveSize) {
-    throwIfAborted(signal)
-    const wave = plans.slice(start, start + waveSize)
-    const started = []
-    for (const plan of wave) {
-      throwIfAborted(signal)
-      const remaining = Math.max(2000, deadline - Date.now())
-      try {
-        const activation = await subagents.startActivation({
-          provider: 'spawn',
-          label: `work-chain ${plan.member.name}`,
-          delivery: 'parent',
-          signal: AbortSignal.any([signal, AbortSignal.timeout(remaining)]),
-          request: {
-            prompt: [
-              {
-                type: 'text',
-                text: buildRotatingPrompt({
-                  task: options.task,
-                  subtask: plan.role,
-                  member: plan.member,
-                  runId: options.runId,
-                  resultFile: plan.resultFile,
-                }),
-              },
-            ],
-            parent: lead,
-            agentOptions: { provider: plan.member.provider, model: plan.member.model },
-          },
-        })
-        started.push({ plan, activation })
-      } catch (error) {
-        results.push({ plan, error: errorMessage(error) })
-      }
-    }
-    for (const item of started) {
-      let entry
-      try {
-        const result = await item.activation.result
-        const applied = readAppliedRoute(ctx, item.activation.childId)
-        const fileText = readResultFile(item.plan.resultFile)
-        const output = fileText ?? blocksToText(result?.output)
-        entry = {
-          plan: item.plan,
-          actualProvider: applied?.provider,
-          actualModel: applied?.model,
-          stopReason: result?.stopReason,
-          diagnostic: result?.diagnostic,
-          output,
-        }
-      } catch (error) {
-        const fileText = readResultFile(item.plan.resultFile)
-        entry = {
-          plan: item.plan,
-          error: errorMessage(error),
-          ...(fileText === undefined ? {} : { output: fileText }),
-        }
-      } finally {
-        try {
-          await item.activation.dispose()
-        } catch {
-          /* 释放失败不影响结果 */
-        }
-      }
-      results.push(entry)
-    }
-  }
-  return results
-}
-
-/** 轮换模式下由 Lead 代成员结算任务板：claim → edit(摘要) → complete；失败则删掉任务避免留脏。 */
-async function settleRotatingTask(agentTeams, lead, taskId, summary, failed) {
-  try {
-    let view = agentTeams.getTask(lead, taskId)
-    if (failed === true) {
-      if (view.status !== 'completed') {
-        await agentTeams.updateTask(lead, { taskId, expectedRevision: view.revision, action: 'delete' })
-      }
-      return
-    }
-    if (view.status === 'pending') {
-      view = await agentTeams.updateTask(lead, { taskId, expectedRevision: view.revision, action: 'claim' })
-    }
-    if (view.status === 'in_progress') {
-      view = await agentTeams.updateTask(lead, {
-        taskId,
-        expectedRevision: view.revision,
-        action: 'edit',
-        description: escapeTaskText(summary, TASK_DESCRIPTION_LIMIT),
-      })
-      await agentTeams.updateTask(lead, { taskId, expectedRevision: view.revision, action: 'complete' })
-      return
-    }
-  } catch {
-    /* 结算失败就走删除兜底 */
-  }
-  try {
-    const view = agentTeams.getTask(lead, taskId)
-    if (view.status !== 'completed') {
-      await agentTeams.updateTask(lead, { taskId, expectedRevision: view.revision, action: 'delete' })
-    }
-  } catch {
-    /* 留着的脏任务不影响结果 */
-  }
 }
 
 /** 工作流（work_flow）持久状态：按 Lead 会话保存 runId、key→taskId 映射、任务尝试次数。 */
@@ -1170,7 +1031,7 @@ function apply(ctx) {
   const disposeTool = ctx.tools.register({
     name: 'work_chain',
     description:
-      'Run one fan-out work chain with the built-in Agent Teams. The current session stays the leader and supplies the task; each configured member gets one subtask with its own model and writes the full result under .workchain/<runId>/. Two modes: "rotate" (default) runs every member as a disposable in-process subagent — each one is released as soon as its task finishes, so the next member gets a fresh agent and the chain is NOT limited by the team agent slots; "team" keeps members as durable Agent Teams teammates (visible in the team UI, task board, reused by name) up to the "max agents" limit from Settings, skipping members that cannot get a slot. Use it when a task benefits from several independent model perspectives or parallel work. Only the Team Lead may call it. Configure members (name/provider/model) and the default mode on the Work Chain bundle page.',
+      'Run one fan-out work chain with the built-in Agent Teams. The current session stays the leader and supplies the task; each configured member becomes a durable Agent Teams teammate with its own model and writes the full result under .workchain/<runId>/. Members are visible on the team UI and task board, are reused by name across calls, and are limited by the "max agents" setting; members that cannot get a slot are skipped and reported. Use it when a task benefits from several independent model perspectives or parallel work. Only the Team Lead may call it. Configure members (name/provider/model) on the Work Chain bundle page.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1179,12 +1040,6 @@ function apply(ctx) {
         task: {
           type: 'string',
           description: 'The overall task the members should work on. The leader synthesizes their results afterwards.',
-        },
-        mode: {
-          type: 'string',
-          enum: ['rotate', 'team'],
-          description:
-            'Member lifecycle: "rotate" = one disposable subagent per member, released after its task (not limited by team slots); "team" = durable Agent Teams teammates, reused across calls, limited by the agent-slot setting. Defaults to the configured mode.',
         },
         subtasks: {
           type: 'array',
@@ -1236,7 +1091,6 @@ function apply(ctx) {
       throwIfAborted(signal)
 
       const config = readConfig()
-      const mode = args.mode === 'team' || args.mode === 'rotate' ? args.mode : config.mode
       const timeoutSeconds =
         args.timeout_seconds === undefined
           ? config.timeoutSeconds
@@ -1267,70 +1121,49 @@ function apply(ctx) {
       let plans
       let planItems = []
       let skipped = []
-      if (mode === 'rotate') {
-        // 轮换模式不受团队槽位限制：每个成员跑完即释放，插件的寿命上限只受子代理并发（最多 8）约束。
-        let members = requestedMembers
-        if (members.length > 16) {
-          notes.push(`配置了 ${members.length} 个成员，轮换模式最多一次跑 16 个，只用前 16 个`)
-          members = members.slice(0, 16)
-        }
-        plans = members.map((member, index) => {
-          const requested = subtasks[index]
-          const role =
-            requested !== undefined && typeof requested.prompt === 'string' && requested.prompt.length > 0
-              ? requested.prompt
-              : `独立完成总任务中你负责的部分（编号 ${index + 1}）。如果与其他成员并行，请选择不重复的角度，给出可核查的结论与来源。`
-          const title =
-            requested !== undefined && typeof requested.title === 'string' && requested.title.trim().length > 0
-              ? requested.title.trim()
-              : `${member.name} · 工作链分工`
-          return { member, title, role, reuse: undefined }
-        })
-      } else {
-        let members = requestedMembers
-        if (members.length > policy.maxMembers) {
-          notes.push(`配置了 ${members.length} 个成员，超过智能体上限 ${policy.maxMembers}，本次只用前 ${policy.maxMembers} 个`)
-          members = members.slice(0, policy.maxMembers)
-        }
-        let slotsLeft = Math.max(0, policy.maxMembers - teammatesBefore.length)
-        const usedReuseNames = new Set()
-        for (const [index, member] of members.entries()) {
-          const existing = reusableByName.get(member.name)
-          if (existing !== undefined && !usedReuseNames.has(existing.name)) {
-            usedReuseNames.add(existing.name)
-            planItems.push({ member, index, reuse: existing })
-          } else if (slotsLeft > 0) {
-            planItems.push({ member, index, reuse: undefined })
-            slotsLeft -= 1
-          } else {
-            // 槽位已满：不换模型/不挪用旧成员，直接跳过并报告；新开一个对话即可获得全新槽位。
-            skipped.push({
-              name: member.name,
-              model: member.model,
-              reason: `没有空余智能体槽位（设置上限 ${policy.maxMembers}，已用 ${teammatesBefore.length}）；新开一个对话即可重置槽位`,
-            })
-          }
-        }
-        if (planItems.length === 0) {
-          const reusableNames = [...reusableByName.keys()]
-          throw new Error(
-            `没有可用的智能体槽位：设置上限 ${policy.maxMembers}，当前已用 ${teammatesBefore.length}。请到设置里调大智能体上限（或删掉一些 teammate），或使用已有成员：${reusableNames.length > 0 ? reusableNames.join(', ') : '（无）'}；也可以把 mode 设为 rotate（一次性子代理，不受槽位限制）`,
-          )
-        }
-        if (skipped.length > 0) notes.push(`${skipped.length} 个成员因槽位不足被跳过：${skipped.map((row) => row.name).join(', ')}`)
-        plans = planItems.map((item) => {
-          const requested = subtasks[item.index]
-          const role =
-            requested !== undefined && typeof requested.prompt === 'string' && requested.prompt.length > 0
-              ? requested.prompt
-              : `独立完成总任务中你负责的部分（编号 ${item.index + 1}）。如果与其他成员并行，请选择不重复的角度，给出可核查的结论与来源。`
-          const title =
-            requested !== undefined && typeof requested.title === 'string' && requested.title.trim().length > 0
-              ? requested.title.trim()
-              : `${item.member.name} · 工作链分工`
-          return { member: item.member, title, role, reuse: item.reuse }
-        })
+      let members = requestedMembers
+      if (members.length > policy.maxMembers) {
+        notes.push(`配置了 ${members.length} 个成员，超过智能体上限 ${policy.maxMembers}，本次只用前 ${policy.maxMembers} 个`)
+        members = members.slice(0, policy.maxMembers)
       }
+      let slotsLeft = Math.max(0, policy.maxMembers - teammatesBefore.length)
+      const usedReuseNames = new Set()
+      for (const [index, member] of members.entries()) {
+        const existing = reusableByName.get(member.name)
+        if (existing !== undefined && !usedReuseNames.has(existing.name)) {
+          usedReuseNames.add(existing.name)
+          planItems.push({ member, index, reuse: existing })
+        } else if (slotsLeft > 0) {
+          planItems.push({ member, index, reuse: undefined })
+          slotsLeft -= 1
+        } else {
+          // 槽位已满：不换模型/不挪用旧成员，直接跳过并报告；新开一个对话即可获得全新槽位。
+          skipped.push({
+            name: member.name,
+            model: member.model,
+            reason: `没有空余智能体槽位（设置上限 ${policy.maxMembers}，已用 ${teammatesBefore.length}）；新开一个对话即可重置槽位`,
+          })
+        }
+      }
+      if (planItems.length === 0) {
+        const reusableNames = [...reusableByName.keys()]
+        throw new Error(
+          `没有可用的智能体槽位：设置上限 ${policy.maxMembers}，当前已用 ${teammatesBefore.length}。请到设置里调大智能体上限（或删掉一些 teammate），或使用已有成员：${reusableNames.length > 0 ? reusableNames.join(', ') : '（无）'}；新开一个对话也可以重置槽位`,
+        )
+      }
+      if (skipped.length > 0) notes.push(`${skipped.length} 个成员因槽位不足被跳过：${skipped.map((row) => row.name).join(', ')}`)
+      plans = planItems.map((item) => {
+        const requested = subtasks[item.index]
+        const role =
+          requested !== undefined && typeof requested.prompt === 'string' && requested.prompt.length > 0
+            ? requested.prompt
+            : `独立完成总任务中你负责的部分（编号 ${item.index + 1}）。如果与其他成员并行，请选择不重复的角度，给出可核查的结论与来源。`
+        const title =
+          requested !== undefined && typeof requested.title === 'string' && requested.title.trim().length > 0
+            ? requested.title.trim()
+            : `${item.member.name} · 工作链分工`
+        return { member: item.member, title, role, reuse: item.reuse }
+      })
 
       // 建团队任务
       const created = []
@@ -1366,92 +1199,6 @@ function apply(ctx) {
           resultFile,
         })
         created.push({ ...plan, taskId: view.id, taskRevision: view.revision, baseDescription: description, resultFile, prompt: withTask, index })
-      }
-
-      if (mode === 'rotate') {
-        // 轮换模式：每个成员 = 一次性子代理，任务完成即释放，再拉下一个/下一批。
-        const startedAt = Date.now()
-        try {
-          fs.mkdirSync(runDir, { recursive: true })
-        } catch {
-          /* 写不进也没关系，结果从子代理输出兜底 */
-        }
-        const waveSize = Math.max(1, Math.min(config.maxParallel, 8))
-        const rotateResults = await runRotatingMembers({
-          ctx,
-          agentTeams,
-          lead,
-          plans: created,
-          waveSize,
-          task,
-          runId,
-          timeoutSeconds,
-          signal,
-        })
-        const membersOut = []
-        let budget = TOOL_OUTPUT_LIMIT
-        for (const result of rotateResults) {
-          const hasOutput = typeof result.output === 'string' && result.output.trim().length > 0
-          const stopBad =
-            result.error !== undefined || (result.stopReason !== undefined && result.stopReason !== 'completed')
-          // 子代理以非完成状态退出但已经写出结果文件时，仍按“有结果”处理（附带告警）。
-          const completedEntry = hasOutput || (stopBad !== true && result.stopReason === 'completed')
-          const warning =
-            stopBad === true && hasOutput === true
-              ? `子代理退出状态异常（${result.error ?? result.stopReason ?? result.diagnostic ?? '未知'}），但结果文件已生成`
-              : undefined
-          const summary =
-            hasOutput === true
-              ? result.output
-              : stopBad === true
-                ? `【失败】${result.error ?? result.diagnostic ?? result.stopReason ?? '未知原因'}`
-                : '（子代理没有输出）'
-          await settleRotatingTask(agentTeams, lead, result.plan.taskId, summary, completedEntry !== true)
-          const entry = {
-            name: result.plan.member.name,
-            provider: result.plan.member.provider,
-            model: result.plan.member.model,
-            actualProvider: result.actualProvider,
-            actualModel: result.actualModel,
-            worker: 'subagent',
-            stopReason: result.stopReason,
-            taskId: result.plan.taskId,
-            taskStatus: completedEntry === true ? 'completed' : 'failed',
-            summary: escapeTaskText(summary, 4000),
-            summarySource: 'file',
-            file: result.plan.resultFile,
-            fileFound: fs.existsSync(result.plan.resultFile),
-            ...(warning === undefined ? {} : { warning }),
-            ...(result.error === undefined ? {} : { error: result.error }),
-            ...(result.diagnostic === undefined ? {} : { diagnostic: result.diagnostic }),
-          }
-          if (hasOutput === true && budget > 0) {
-            entry.output = summary.length > budget ? summary.slice(0, budget) : summary
-            budget -= entry.output.length
-          }
-          membersOut.push(entry)
-        }
-        const completed = membersOut.filter((member) => member.taskStatus === 'completed').length
-        return jsonSafe({
-          runId,
-          mode: 'rotate',
-          leader,
-          members: membersOut,
-          completed,
-          timedOut: false,
-          elapsedMs: Date.now() - startedAt,
-          runDir,
-          team: {
-            mode: 'rotate',
-            maxMembers: policy.maxMembers,
-            limitSource: policy.source,
-            usedBefore: teammatesBefore.length,
-            waveSize,
-            reused: 0,
-            skipped: [],
-          },
-          notes,
-        })
       }
 
       // 派活：可复用同名同模型的成员（发消息），否则以该成员模型 spawn 新 teammate
@@ -2169,7 +1916,6 @@ export {
   normalizeAesthetic,
   buildAestheticPrompt,
   formatAestheticOutput,
-  buildRotatingPrompt,
   readTeamPolicy,
   teamSnapshot,
   buildModelCatalog,

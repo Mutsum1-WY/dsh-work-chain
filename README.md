@@ -2,38 +2,36 @@
 
 把 **当前会话当 leader**、把**多个指定模型的成员**当手下，靠内置 **Agent Teams**（任务板/名册）做协调的 fan-out 工作流插件。适合「让几个不同模型并行干活、leader 汇总」的场景，比如：并行调研/多视角 review/分工写代码。
 
-默认是 **rotate（轮换）模式**：每个成员是一个**一次性子代理**，干完自己的活就**立刻释放**，再拉下一个/下一批 —— 相当于「完成一个任务 → 删掉这个智能体 → 新建下一个」，因此**不受团队常驻智能体数量上限限制**，一个对话里也能反复用多种模型。也保留 `team` 模式：成员是常驻 Agent Teams 队友（出现在团队 UI、跨调用复用、受设置里智能体上限约束）。
+成员都是**常驻 Agent Teams 队友**（`team` 模式；v0.7.0 起移除了一次性子代理的 `rotate` 模式）：出现在团队 UI、跨调用同名复用、受设置里智能体上限约束；每个成员按自己配置的模型运行，leader 汇总结果。
 
 > **v0.6.0 新增「审美顾问」**：leader 可以用 `aesthetic_advice` 把成果（网页/界面、截图、URL 或文字描述）交给一个**独立的审美评审子代理**，拿回「总评分数 + 按影响排序的具体修改建议」；它**只给建议、不改任何文件**，开关/模型/审美偏好都在插件配置卡片里。详见下文「审美顾问（`aesthetic_advice`，v0.6.0）」。
 
 > **v0.6.1 改成员命名**：成员名默认直接取所选**模型名**（`deepseek-v4.1-flash` → `deepseek-v4-1-flash`，因为 DSH 队友名只接受 lower-kebab-case）；同名自动编号 `-2`、`-3`…（即二号、三号）。旧配置里的 `pro` / `haiku` / `kimi` / `ds-flash` 读入时会按模型名自动迁移。详见下文「成员命名（v0.6.1）」。
 
+> **v0.7.0 移除 rotate 模式**：只保留 `team`（常驻 Agent Teams 队友）模式。插件页不再有「成员模式」选择，`work_chain` 也没有 `mode` 参数；旧配置里的 `mode` 字段会被忽略。想让成员并行更多就调大设置里的智能体上限，或新开一个对话重置槽位。升级后**刷新一次插件页**（旧缓存页面可能还显示模式单选，它提交的 `mode` 会被新宿主忽略）。
+
 ## 它怎么工作（一句话版）
 
 1. 你在顶栏把当前会话切到想当 leader 的模型；
-2. 在「插件」页 → 已安装插件 → **工作链** 的配置卡片里配好 members（provider / model；name 已按模型名自动预填，也可手改）和模式（rotate / team）；
+2. 在「插件」页 → 已安装插件 → **工作链** 的配置卡片里配好 members（provider / model；name 已按模型名自动预填，也可手改）；
 3. 对 agent 说「用工作链做 XXX」（或直接让它调 `work_chain`）；
-4. 插件按模式派活：
-   - **rotate**：按 `maxParallel` 分批拉起一次性子代理（模型=成员配置），跑完一批立刻释放；
-   - **team**：为每个成员在团队名册里建/复用 teammate，按各模型运行；
-5. 成员把完整结果写到 `.workchain/<runId>/<member>.md`；rotate 模式下由 leader 代成员把摘要写进任务板；
+4. 插件为每个成员在团队名册里建/复用 teammate，按各自模型运行；
+5. 成员把完整结果写到 `.workchain/<runId>/<member>.md`，并把摘要写进团队任务板；
 6. 插件收集结果（任务板摘要 + 结果文件）交回 leader 汇总。
 
 > leader 不是插件另开的进程，就是当前这个会话；它负责拆任务（可在 `work_chain` 的 `subtasks` 里传拆解结果）和最后汇总。
 
 ## 为什么能「每个 member 不同模型」
 
-- **rotate 模式**：直接调内置子代理服务 `ctx.subagents.startActivation`，在 `request.agentOptions` 里带 `{provider, model}`，子代理就按指定模型运行；跑完 `dispose()` 释放。
-- **team 模式**：内置 `spawn_teammate` 没有模型参数，插件在 `agent/created`（serial）里认出刚创建的 teammate，在它的 scoped context 上挂 `agent/request` / `system-prompt/assemble` waterfall（与官方 `installModelSelection` 同套路），把每次模型请求固定为配置的 `provider/model`。
+- **成员就是 Agent Teams teammate**：内置 `spawn_teammate` 没有模型参数，插件在 `agent/created`（serial）里认出刚创建的 teammate，在它的 scoped context 上挂 `agent/request` / `system-prompt/assemble` waterfall（与官方 `installModelSelection` 同套路），把每次模型请求固定为配置的 `provider/model`。
 
 因此：
 
-- 两种模式下每个成员都用**自己配置的模型**运行；
-- rotate 成员是一次性的（跑完即删，不占团队槽位，也不跨调用复用）；
-- team 成员是真正的 Agent Teams teammate（团队 UI、消息、任务板、跨调用复用）；
-- 不 patch 任何共享服务方法，插件卸载/HMR 时相关监听/子代理一起回收。
+- 每个成员都用**自己配置的模型**运行；
+- 成员是真正的 Agent Teams teammate（团队 UI、消息、任务板、跨调用复用）；
+- 不 patch 任何共享服务方法，插件卸载/HMR 时相关监听一起回收。
 
-> 注意：team 名册（`list_agents`）里显示的 `model` 可能仍是继承值；rotate 子代理跑完即释放，工具输出里的模型以成员配置与子代理自报为准。
+> 注意：team 名册（`list_agents`）里显示的 `model` 可能仍是继承值，工具输出里的模型以成员配置与 `actualModel` 为准。
 
 ## 依赖
 
@@ -45,9 +43,7 @@
 
 ## 已知限制（实测）
 
-- **team 模式槽位有限且不可回收**：团队 teammate 总数 = 设置里的智能体上限（desktop 默认 8），名册不能删成员。team 模式每次调用会先复用同名成员、再用空余槽位；不够就跳过并报告。**rotate 模式不受这个限制**（一次性子代理，跑完释放）；team 模式想扩员就新开一个对话或调大设置上限。
-- **rotate 模式每批最多 8 个**：受宿主 `subagent.maxActiveSubagents`（默认 8）限制，`maxParallel` 再大也只按 8 一批；成员超过一批时自动分多批串行跑（每批之间释放上一批）。
-- **rotate 子代理不进入团队名册**：它们能用文件/工具，但用不了团队任务/消息工具；任务板由 leader 代写摘要（出问题会删除该任务）。
+- **成员槽位有限且不可回收**：团队 teammate 总数 = 设置里的智能体上限（desktop 默认 8），名册不能删成员。每次调用会先复用同名成员、再用空余槽位；不够就跳过并报告。想扩员就新开一个对话或调大设置上限。
 - **内置团队偶发 provisioning 竞态**：`spawnTeammate` 可能报 `initial prompt was not durably accepted`（agent-team 的 `checkpointInitialPrompt` 竞态，与成员模型无关）。插件会自动换名字重试一次；仍失败时该成员标记为 `派活错误`，其余成员照常完成，失败任务会从任务板删除。
 - **任务板 description 的 16KB 上限 + 成员可能写不回摘要**：个别模型调用 `team_task_update` 时参数可能丢失，此时任务板 description 仍是原始派活文本；插件会自动退回**用结果文件内容**做摘要（输出里 `summarySource: file`），结果不丢。
 - **成员的模型锁定靠 agent scoped event**（`agent/request` + `system-prompt/assemble` waterfall），不 patch 任何共享服务；团队名册里显示的 `model` 可能仍是继承值，以工具输出的 `actualModel` 为准。
@@ -110,7 +106,6 @@ E:\凑鲸鱼\plugins\dsh-work-chain
   "members": [
     { "name": "deepseek-v4-1-flash", "provider": "opencode-go", "model": "deepseek-v4.1-flash" }
   ],
-  "mode": "rotate",
   "maxParallel": 4,
   "timeoutSeconds": 600,
   "catalog": {
@@ -151,7 +146,7 @@ E:\凑鲸鱼\plugins\dsh-work-chain
 - **升级提示（旧对话）**：v0.6.1 前已经建好的 teammate 名字还是旧的（`pro`/`haiku` 等），不会被新名字复用；旧对话里跑 team 模式 / `work_flow` 时若槽位不够会跳过并提示——**新开一个对话**（团队名册从 0 开始）再跑即可。
 - 名字仍可手改，但必须满足 lower-kebab-case 且 ≤64 字符——**中文/空格/点号不能直接用在队友名里**，这是 DSH 内置团队的限制。
 
-> 为什么不是中文「一号、二号」？内置 Agent Teams 的 `spawn_teammate` 只接受 lower-kebab-case 名字，中文会被内核以 `TEAM_INVALID_MEMBER_NAME` 拒绝，所以用 `-2`、`-3` 表示二号、三号；rotate 模式的一次性子代理标题也沿用这些名字，方便和 team 名册对应。
+> 为什么不是中文「一号、二号」？内置 Agent Teams 的 `spawn_teammate` 只接受 lower-kebab-case 名字，中文会被内核以 `TEAM_INVALID_MEMBER_NAME` 拒绝，所以用 `-2`、`-3` 表示二号、三号；工具输出、任务板与团队名册里都沿用这些名字，方便互相对应。
 
 ## 用法
 
@@ -172,7 +167,6 @@ agent 会调用：
 ```json
 {
   "task": "给这个仓库做一次上线前 review",
-  "mode": "rotate",
   "subtasks": [
     { "title": "安全审查", "prompt": "审查鉴权、注入、依赖风险", "member": "deepseek-v4-1-flash" },
     { "title": "性能", "prompt": "找性能瓶颈与优化点", "member": "deepseek-v4-1-flash-2" },
@@ -181,7 +175,7 @@ agent 会调用：
 }
 ```
 
-调用返回：`runId`、`mode`、`team{maxMembers, limitSource, usedBefore, waveSize, skipped}`、`notes`、每个成员的 `taskId/状态/摘要/结果文件内容`、是否超时、耗时；leader 据此做最终汇总。成员结果文件在 `<cwd>/.workchain/<runId>/`。
+调用返回：`runId`、`team{maxMembers, limitSource, usedBefore, reused, skipped}`、`notes`、每个成员的 `taskId/状态/摘要/结果文件内容`、是否超时、耗时；leader 据此做最终汇总。成员结果文件在 `<cwd>/.workchain/<runId>/`。
 
 ## 对话页「工作流模式」开关
 
@@ -223,13 +217,9 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 > 提示：worker 池在**新对话**里最容易一次建满（槽位从 0 开始）；老对话槽位满时只能复用已有成员名，或到设置里调大智能体上限。
 
 
-| 模式 | 行为 | 适合 |
-| --- | --- | --- |
-| `rotate`（默认） | 每个成员 = **一次性子代理**，按 `maxParallel` 分批拉起（每批最多 8），跑完一批立刻 `dispose()` 释放，再拉下一批。**不受团队常驻智能体上限限制**，同一对话可跑很多成员/模型。 | 想多模型并行、又不想被槽位卡住（推荐） |
-| `team` | 成员是常驻 Agent Teams teammate：出现在团队 UI、能读写任务板、跨调用同名复用；数量受**设置里的智能体上限**约束，槽位不足时跳过并报告。 | 需要成员持久化、团队可见/可干预 |
+### 成员生命周期与智能体数量
 
-### team 模式：智能体数量以「设置里的智能体上限」为准
-
+- 成员都是常驻 Agent Teams teammate：出现在团队 UI、能读写任务板、跨调用同名复用；数量受**设置里的智能体上限**约束，槽位不足时跳过并报告。
 - 实时读取内置团队当前生效的 `maxMembers`（`runtime` = 运行中团队服务，设置改动热更新后立即跟随；退回 `config` 读 agent-team 配置行；最后回退 8）。
 - 规划顺序：同名 teammate 直接复用（不占新槽位）→ 还有空槽就按该成员模型新建 → 槽位已满则该成员**跳过并报告**（不换模型、不挪用其它成员）。
 - 槽位不够时：**新开一个对话**（团队成员从 0 开始），或到**设置**里把智能体上限调大；插件下一次调用/保存即跟随。
@@ -238,26 +228,22 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 
 | 位置 | 字段 | 说明 |
 | --- | --- | --- |
-| 插件页 GUI / `$DSH_HOME/work-chain/config.json` | `members[]` | `{name, provider, model}`；`name` 必须 lower-kebab-case 且 ≤64 字符、唯一；留空会自动取模型名；最多 64 个（rotate 一次最多跑 16 个，team 模式按设置上限） |
+| 插件页 GUI / `$DSH_HOME/work-chain/config.json` | `members[]` | `{name, provider, model}`；`name` 必须 lower-kebab-case 且 ≤64 字符、唯一；留空会自动取模型名；数量上限 64，实际可用数按设置里的智能体上限裁 |
 | 同上 | `members`（默认值） | 4 个成员，均为 `opencode-go/deepseek-v4.1-flash`：`deepseek-v4-1-flash` / `-2` / `-3` / `-4`（v0.6.1 起名字取模型名，重名按序号；v0.5.0 起全部为 flash） |
 | 同上 | `namingVersion` | 配置命名版本（v0.6.1）：`2` = 成员名由模型名生成；旧配置缺该字段时读入自动迁移并补成 `2` |
-| 同上 | `mode` | `rotate`（默认）/ `team` |
-| 同上 | `maxParallel` | 1~8：rotate = 每批并发数；team = 提示并行度（实际并发还受宿主 subagent 并发上限约束） |
+| 同上 | `maxParallel` | 1~8：`work_flow` 每轮默认派活的成员数（可通过 `max_assign` 覆盖） |
 | 同上 | `timeoutSeconds` | 30~3600，整条链的总等待预算（默认 600 秒） |
 | 同上 | `aesthetic` | `{enabled, provider, model, styleNotes}`（v0.6.0 审美顾问）：默认 `true` / `opencode-go` / `deepseek-v4.1-flash` / `''`；`styleNotes` 是拼进审美顾问提示词的偏好文本，保存时截到 **4000 字**；`enabled` 只在显式 `false` 时关闭 |
-| `work_chain` 参数 | `mode` | 本次调用覆盖模式 |
-| 同上 | `members` | 本次调用临时覆盖成员 |
+| `work_chain` 参数 | `members` | 本次调用临时覆盖成员 |
 | 同上 | `subtasks[]` | leader 拆好的分工；不传则每个成员独立做总任务 |
 | 同上 | `timeout_seconds` | 本次调用覆盖等待预算 |
 
-### 成员复用（仅 team 模式）
+### 成员复用
 
 - **同名成员复用**：config 里 `name` 稳定的成员第二次调用会被直接复用（`send_message` 唤醒，不新建、不占槽位），并重新锁定成当前配置的模型；同一次调用里每个成员只会用一次。
 - **槽位不足则跳过**：不会换模型、不挪用别的 teammate，只在输出里报告该成员被跳过；**新开一个对话**即可重置槽位。
 - 名册里 `status=failed` 的成员不复用；重名时插件会自动加后缀（`-2`、`-r2`）。
 - 成员名默认就是模型名（`deepseek-v4-1-flash` 等），换模型时自动跟随；同名按 `-2`、`-3` 编号，看名字就知道每个 teammate 跑的是什么模型。
-
-> rotate 模式的成员是一次性的（跑完即删），不参与复用；每次调用都是全新的子代理，因此即使团队槽位用满也能跑。
 
 ## 审美顾问（`aesthetic_advice`，v0.6.0）
 
@@ -323,7 +309,7 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 
 ## 结果与任务板
 
-- **任务板**：每次 `work_chain` 会为每个成员建一条团队任务（subject=分工标题）。team 模式由成员 claim → 编辑 description 写摘要 → complete；rotate 模式成员不在团队里，由 **leader 代写**（claim → edit 摘要 → complete，失败则删任务），进度仍可在团队任务板里看到。
+- **任务板**：每次 `work_chain` 会为每个成员建一条团队任务（subject=分工标题）。成员 claim → 编辑 description 写摘要 → complete，进度在团队任务板里可见；派活失败的任务会被删除，避免留下永远 pending 的脏任务。
 - **结果文件**：成员把完整 Markdown 写在 `.workchain/<runId>/<member>.md`（工具输出会读回；太长会截断，完整内容看文件）。
 - **审美建议文件（v0.6.0）**：`aesthetic_advice` 的建议写在 `<cwd>/.aesthetic/<runId>/advice.md`，不经过团队任务板；工具输出给 leader 的是「首行路由/用时/文件路径 + 建议正文」。完整内容看文件。
 - **超时**：到 `timeoutSeconds` 仍未完成会返回 `timedOut: true` 并打断仍在运行的成员，已完成的成员结果照常返回。
@@ -340,11 +326,11 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 | `aesthetic_advice` 报「只能由 Team Lead 调用」（v0.6.0） | 当前会话不是 Lead（是 teammate/子代理）：换成由你发起的会话（那就是 Lead）再调用 |
 | `aesthetic_advice` 返回 `timedOut: true` / 报「审美顾问调用失败」 | 模型不可路由（provider 无凭据）或超时：在配置卡片换一个可路由的审美模型，或把 `timeout_seconds` 调大（30~600）；`error` 字段里是原始错误 |
 | 某个成员 spawn 失败 | 模型/provider 在该会话不可用（`opencode-go` 需要有效凭据）；在配置里换模型后重试；错误会写进该成员条目 |
-| 全部成员都没跑起来 | 看 `list_bundles` 的 `subagent-spawn-in-process` 行是否活跃；`maxMembers=16` 是否已满 |
+| 全部成员都没跑起来 | 看 `list_bundles` 的 `subagent-spawn-in-process` 行是否活跃；设置里的智能体上限是否已满（默认 8） |
 | 结果文件缺失但任务完成 | 成员偷懒没写文件；摘要仍在任务板里，工具输出会标 `结果文件缺失` |
 | 下拉里没有某个供应商 | 该供应商未在 DSH 设置中配置或凭据无效：到 DSH 设置里配置该供应商/凭据，然后在插件卡片点「重新加载」 |
 | provider 行显示 `providerFallback` / 当前值（非下拉选项） | 宿主 catalog 没读到（宿主未更新或 LLM 服务异常）：点「重新加载」；仍不行就重装组合包或重启 DSH |
-| 升级 DSH 后失效 | 本插件依赖 `subagents.startActivation` 的内部契约做模型透传；升级后先用一个成员做冒烟测试，必要时按新契约调整 |
+| 升级 DSH 后失效 | 本插件依赖 `subagents.startActivation`（审美顾问）与内置 Agent Teams 的内部契约做模型透传；升级后先用一个成员做冒烟测试，必要时按新契约调整 |
 
 ## 卸载
 
@@ -361,13 +347,12 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 - **测试约定（2026-10-27 起，用户要求）**：插件改动的冒烟测试**只跑一个成员**（`opencode-go/deepseek-v4.1-flash`，成员名默认 `deepseek-v4-1-flash`），不再跑多模型/多成员/压测；单成员一次约 20~30s。命令形态：
 
   ```json
-  { "mode": "rotate",
-    "task": "冒烟测试：20 字内回答 1+1 并自报模型",
+  { "task": "冒烟测试：20 字内回答 1+1 并自报模型",
     "members": [ { "name": "deepseek-v4-1-flash", "provider": "opencode-go", "model": "deepseek-v4.1-flash" } ],
     "timeout_seconds": 120 }
   ```
 
-  只有改动涉及多成员调度（分波/借用/任务板结算）时，才按需补一次多成员测试。
+  只有改动涉及多成员调度（复用/借用/任务板结算）时，才按需补一次多成员测试。
 
 - 审美顾问的真机验证不需要成员：一次 `aesthetic_advice` 调用即可（`target` 传一个本地文件路径，`timeout_seconds` 给 60~120），它不占团队常驻槽位；上面的 fake ctx 冒烟脚本本身不消耗模型额度。
 
