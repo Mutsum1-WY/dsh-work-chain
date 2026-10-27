@@ -53,10 +53,10 @@
 
 ## 安装
 
-插件管理器 →「添加插件」→「安装第三方插件」→ 本地目录填：
+插件管理器 →「添加插件」→ 填 GitHub 仓库地址（或用「安装第三方插件」填本地插件源码目录）：
 
 ```text
-E:\凑鲸鱼\plugins\dsh-work-chain
+https://github.com/Mutsum1-WY/dsh-work-chain
 ```
 
 安装完成后到「插件」页 → 已安装插件，打开 **工作链**：
@@ -268,7 +268,7 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 
 ```json
 {
-  "target": "E:/凑鲸鱼/apps/web/dist/index.html",
+  "target": "apps/web/dist/index.html",
   "focus": "配色与字号层级",
   "context": "面向开发者的设置页，信息密度高，希望克制但不冷淡"
 }
@@ -341,10 +341,10 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 - 改完先跑语法检查：`node --check index.js`、`node --check client.js`（两者都必须通过，且都是零第三方依赖的纯 JS）；
 - 宿主：`index.js`（零第三方依赖，`node --check index.js`）；
 - 浏览器半：`client.js`（注册 `plugins.bundle.config` 配置页，`node --check client.js`）；
-- 冒烟脚本：可在 tmp 目录写一个临时脚本，覆盖 catalog 规范化/默认选择/下拉选项等纯函数（`buildModelCatalog` 与 client 的 `interpretCatalog`/`pickDefaultProvider`/`providerSelectOptions`），不写入仓库；
-- **审美顾问自检（v0.6.0）**：宿主半用 `tmp/wc-aesthetic-dev/host-smoke.mjs`（fake ctx + fake activation + 临时 `DSH_HOME`，覆盖默认配置/规范化/工具注册/参数 schema/execute 正常与覆盖/非 lead 拒绝/插件页关闭/`styleNotes` 生效/GET defaults/POST 回显）；浏览器半用 `tmp/wc-aesthetic-client/check.cjs`（fake React 物化配置卡片，覆盖 aesthetic 的解析/规范化/校验/字典键/渲染/保存载荷）。两个脚本都在 tmp 下、不进仓库，跑完不污染真实配置；
+- 冒烟脚本：可以在临时目录写一个一次性脚本，覆盖 catalog 规范化/默认选择/下拉选项等纯函数（`buildModelCatalog` 与 client 的 `interpretCatalog`/`pickDefaultProvider`/`providerSelectOptions`），不要提交到仓库；
+- **审美顾问自检（v0.6.0）**：宿主半写一个一次性脚本（fake ctx + fake activation + 临时 `DSH_HOME`，覆盖默认配置/规范化/工具注册/参数 schema/execute 正常与覆盖/非 lead 拒绝/插件页关闭/`styleNotes` 生效/GET defaults/POST 回显）；浏览器半另写一个一次性脚本（fake React 物化配置卡片，覆盖 aesthetic 的解析/规范化/校验/字典键/渲染/保存载荷）。两个脚本只放在本地临时目录、不提交仓库，跑完不污染真实配置；
 - 配置接口：`GET/POST /plugin-api/work-chain/config`（同源，仅本机 Web 服务提供）。
-- **测试约定（2026-10-27 起，用户要求）**：插件改动的冒烟测试**只跑一个成员**（`opencode-go/deepseek-v4.1-flash`，成员名默认 `deepseek-v4-1-flash`），不再跑多模型/多成员/压测；单成员一次约 20~30s。命令形态：
+- **建议的冒烟测试**：插件改动的冒烟测试**只跑一个成员**（`opencode-go/deepseek-v4.1-flash`，成员名默认 `deepseek-v4-1-flash`），不再跑多模型/多成员/压测；单成员一次约 20~30s。命令形态：
 
   ```json
   { "task": "冒烟测试：20 字内回答 1+1 并自报模型",
@@ -356,4 +356,4 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 
 - 审美顾问的真机验证不需要成员：一次 `aesthetic_advice` 调用即可（`target` 传一个本地文件路径，`timeout_seconds` 给 60~120），它不占团队常驻槽位；上面的 fake ctx 冒烟脚本本身不消耗模型额度。
 
-MIT License，见 `LICENSE`。第三方插件形态与 `plugins/dsh-web-search-opencode` 一致，安装/卸载都走插件管理器。
+MIT License，见 `LICENSE`。第三方插件形态与 `dsh-web-search-opencode` 一致，安装/卸载都走插件管理器。
