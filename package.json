@@ -1,8 +1,8 @@
 {
   "name": "dsh-work-chain",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
-  "description": "Work-chain workflow for DeepSeek Harness: the current session is the leader; configurable members (each with its own model) work the task in parallel as real Agent Teams teammates and report through the built-in team task board. Member provider/model are picked from dropdowns populated by the live DSH provider catalog, defaulting to deepseek-v4.1-flash. Also ships an aesthetic advisor (v0.6.0): a leader-only aesthetic_advice tool that hands a delivered artifact (UI file, screenshot, URL or description) to a disposable reviewer subagent for ranked visual/UI critique — advice only, it never edits files — with its enable switch, model and style notes configurable on the same plugin page.",
+  "description": "Work-chain workflow for DeepSeek Harness: the current session is the leader; configurable members (each with its own model) work the task in parallel as real Agent Teams teammates and report through the built-in team task board. Member provider/model are picked from dropdowns populated by the live DSH provider catalog, defaulting to deepseek-v4.1-flash. Member names default to the selected model name (v0.6.1; duplicates get -2/-3, and legacy pro/haiku/kimi/ds-flash names migrate automatically). Also ships an aesthetic advisor (v0.6.0): a leader-only aesthetic_advice tool that hands a delivered artifact (UI file, screenshot, URL or description) to a disposable reviewer subagent for ranked visual/UI critique — advice only, it never edits files — with its enable switch, model and style notes configurable on the same plugin page.",
   "type": "module",
   "main": "index.js",
   "icon": "./icon.svg",

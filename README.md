@@ -6,10 +6,12 @@
 
 > **v0.6.0 新增「审美顾问」**：leader 可以用 `aesthetic_advice` 把成果（网页/界面、截图、URL 或文字描述）交给一个**独立的审美评审子代理**，拿回「总评分数 + 按影响排序的具体修改建议」；它**只给建议、不改任何文件**，开关/模型/审美偏好都在插件配置卡片里。详见下文「审美顾问（`aesthetic_advice`，v0.6.0）」。
 
+> **v0.6.1 改成员命名**：成员名默认直接取所选**模型名**（`deepseek-v4.1-flash` → `deepseek-v4-1-flash`，因为 DSH 队友名只接受 lower-kebab-case）；同名自动编号 `-2`、`-3`…（即二号、三号）。旧配置里的 `pro` / `haiku` / `kimi` / `ds-flash` 读入时会按模型名自动迁移。详见下文「成员命名（v0.6.1）」。
+
 ## 它怎么工作（一句话版）
 
 1. 你在顶栏把当前会话切到想当 leader 的模型；
-2. 在「插件」页 → 已安装插件 → **工作链** 的配置卡片里配好 members（name / provider / model）和模式（rotate / team）；
+2. 在「插件」页 → 已安装插件 → **工作链** 的配置卡片里配好 members（provider / model；name 已按模型名自动预填，也可手改）和模式（rotate / team）；
 3. 对 agent 说「用工作链做 XXX」（或直接让它调 `work_chain`）；
 4. 插件按模式派活：
    - **rotate**：按 `maxParallel` 分批拉起一次性子代理（模型=成员配置），跑完一批立刻释放；
@@ -87,8 +89,8 @@ E:\凑鲸鱼\plugins\dsh-work-chain
 
 **默认选择规则**：
 - 默认供应商：优先 `opencode-go` 且含 `deepseek-v4.1-flash`；否则任一含该模型的供应商；都没有则取第一组；
-- 新增行 / 默认成员：provider = `defaultProvider`，model = `deepseek-v4.1-flash`（若该供应商下没有此模型，则退回该组第一个模型）；
-- 线上 `config.json` 里已存在的成员保持原值，不会被自动改写。
+- 新增行 / 默认成员：provider = `defaultProvider`，model = `deepseek-v4.1-flash`（若该供应商下没有此模型，则退回该组第一个模型）；name 默认 = 该模型名，重名自动加 `-2`、`-3`…；
+- 线上 `config.json` 里已存在的成员保持原值，不会被自动改写（旧版默认名 `pro`/`haiku`/`kimi`/`ds-flash` 例外，见「成员命名（v0.6.1）」）。
 
 **超时与失败降级**：
 - 单个供应商的 `listModels` 超时为 **8 秒**（`CATALOG_TIMEOUT_MS`）；超时或报错只进 `failures`，其它供应商照常展示；
@@ -106,7 +108,7 @@ E:\凑鲸鱼\plugins\dsh-work-chain
 ```json
 {
   "members": [
-    { "name": "pro", "provider": "opencode-go", "model": "deepseek-v4.1-flash" }
+    { "name": "deepseek-v4-1-flash", "provider": "opencode-go", "model": "deepseek-v4.1-flash" }
   ],
   "mode": "rotate",
   "maxParallel": 4,
@@ -134,6 +136,23 @@ E:\凑鲸鱼\plugins\dsh-work-chain
 
 （以上 `models` 仅为示意，实际列表以 DSH 当前配置为准。）
 
+## 成员命名（v0.6.1）
+
+成员名默认**直接取所选模型名**，不用再手动起 `pro` / `haiku` 这种和模型对不上的别名。
+
+- **转换规则**：DSH Agent Teams 只接受 **lower-kebab-case** 队友名（`^[a-z0-9]+(-[a-z0-9]+)*$`，≤64 字符），所以模型 id 里的 `.`、`_`、空格等会折叠成 `-`：
+  - `deepseek-v4.1-flash` → `deepseek-v4-1-flash`
+  - `gpt-5.6-luna` → `gpt-5-6-luna`
+  - `kimi-k3.1-pro` → `kimi-k3-1-pro`
+- **重名自动编号**：同一模型出现多次时，第一个用纯模型名，之后依次 `-2`、`-3`…（即二号、三号）。例：4 个默认成员 → `deepseek-v4-1-flash`、`deepseek-v4-1-flash-2`、`deepseek-v4-1-flash-3`、`deepseek-v4-1-flash-4`。
+- **跟随模型**：在配置卡片里改 provider / model 时，如果名字是自动生成的（纯模型名或 `-N` 后缀），名字会自动跟着新模型改；手填的名字（如 `writer-1`）保持不动。
+- **留空也行（API/工具/配置文件）**：`members[].name` 为空时，宿主会按该成员的模型自动补名（仍按上面的规则去重）；插件页配置卡片会自动预填名字，手工清空会提示「成员名不能为空」。
+- **旧配置迁移**：v0.6.0 及更早的默认名 `pro` / `haiku` / `kimi` / `ds-flash` 会在**读配置时自动迁移**（内存里生效，重名同样 `-2`、`-3`…）；下次在插件页「保存」（或切换工作流模式开关）时会把迁移结果与 `namingVersion: 2` 落盘，之后不再迁移。想保留自定义名字，改完保存即可。
+- **升级提示（旧对话）**：v0.6.1 前已经建好的 teammate 名字还是旧的（`pro`/`haiku` 等），不会被新名字复用；旧对话里跑 team 模式 / `work_flow` 时若槽位不够会跳过并提示——**新开一个对话**（团队名册从 0 开始）再跑即可。
+- 名字仍可手改，但必须满足 lower-kebab-case 且 ≤64 字符——**中文/空格/点号不能直接用在队友名里**，这是 DSH 内置团队的限制。
+
+> 为什么不是中文「一号、二号」？内置 Agent Teams 的 `spawn_teammate` 只接受 lower-kebab-case 名字，中文会被内核以 `TEAM_INVALID_MEMBER_NAME` 拒绝，所以用 `-2`、`-3` 表示二号、三号；rotate 模式的一次性子代理标题也沿用这些名字，方便和 team 名册对应。
+
 ## 用法
 
 对 agent 说：
@@ -155,9 +174,9 @@ agent 会调用：
   "task": "给这个仓库做一次上线前 review",
   "mode": "rotate",
   "subtasks": [
-    { "title": "安全审查", "prompt": "审查鉴权、注入、依赖风险", "member": "pro" },
-    { "title": "性能", "prompt": "找性能瓶颈与优化点", "member": "kimi" },
-    { "title": "文档与体验", "prompt": "检查 README/错误提示/首次体验", "member": "haiku" }
+    { "title": "安全审查", "prompt": "审查鉴权、注入、依赖风险", "member": "deepseek-v4-1-flash" },
+    { "title": "性能", "prompt": "找性能瓶颈与优化点", "member": "deepseek-v4-1-flash-2" },
+    { "title": "文档与体验", "prompt": "检查 README/错误提示/首次体验", "member": "deepseek-v4-1-flash-3" }
   ]
 }
 ```
@@ -193,7 +212,7 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
     { "key": "audit", "title": "安全审计", "prompt": "审查鉴权/注入/依赖风险" },
     { "key": "fix",   "title": "整改建议", "prompt": "根据审计结果给整改清单", "depends_on": ["audit"] }
   ],
-  "members": [ { "name": "pro", "provider": "opencode-go", "model": "deepseek-v4-pro" } ],
+  "members": [ { "name": "deepseek-v4-pro", "provider": "opencode-go", "model": "deepseek-v4-pro" } ],
   "wait_seconds": 120,
   "max_assign": 2
 }
@@ -219,8 +238,9 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 
 | 位置 | 字段 | 说明 |
 | --- | --- | --- |
-| 插件页 GUI / `$DSH_HOME/work-chain/config.json` | `members[]` | `{name, provider, model}`；`name` 必须 lower-kebab-case 且唯一；最多 64 个（rotate 一次最多跑 16 个，team 模式按设置上限） |
-| 同上 | `members`（默认值） | 4 个成员，均为 `opencode-go/deepseek-v4.1-flash`：`pro` / `haiku` / `kimi` / `ds-flash`（v0.5.0 起全部为 flash，原为不同模型） |
+| 插件页 GUI / `$DSH_HOME/work-chain/config.json` | `members[]` | `{name, provider, model}`；`name` 必须 lower-kebab-case 且 ≤64 字符、唯一；留空会自动取模型名；最多 64 个（rotate 一次最多跑 16 个，team 模式按设置上限） |
+| 同上 | `members`（默认值） | 4 个成员，均为 `opencode-go/deepseek-v4.1-flash`：`deepseek-v4-1-flash` / `-2` / `-3` / `-4`（v0.6.1 起名字取模型名，重名按序号；v0.5.0 起全部为 flash） |
+| 同上 | `namingVersion` | 配置命名版本（v0.6.1）：`2` = 成员名由模型名生成；旧配置缺该字段时读入自动迁移并补成 `2` |
 | 同上 | `mode` | `rotate`（默认）/ `team` |
 | 同上 | `maxParallel` | 1~8：rotate = 每批并发数；team = 提示并行度（实际并发还受宿主 subagent 并发上限约束） |
 | 同上 | `timeoutSeconds` | 30~3600，整条链的总等待预算（默认 600 秒） |
@@ -235,7 +255,7 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 - **同名成员复用**：config 里 `name` 稳定的成员第二次调用会被直接复用（`send_message` 唤醒，不新建、不占槽位），并重新锁定成当前配置的模型；同一次调用里每个成员只会用一次。
 - **槽位不足则跳过**：不会换模型、不挪用别的 teammate，只在输出里报告该成员被跳过；**新开一个对话**即可重置槽位。
 - 名册里 `status=failed` 的成员不复用；重名时插件会自动加后缀（`-2`、`-r2`）。
-- 建议成员名带模型特征（`pro`、`haiku`、`kimi`），配置改变时更好追踪。
+- 成员名默认就是模型名（`deepseek-v4-1-flash` 等），换模型时自动跟随；同名按 `-2`、`-3` 编号，看名字就知道每个 teammate 跑的是什么模型。
 
 > rotate 模式的成员是一次性的（跑完即删），不参与复用；每次调用都是全新的子代理，因此即使团队槽位用满也能跑。
 
@@ -338,12 +358,12 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 - 冒烟脚本：可在 tmp 目录写一个临时脚本，覆盖 catalog 规范化/默认选择/下拉选项等纯函数（`buildModelCatalog` 与 client 的 `interpretCatalog`/`pickDefaultProvider`/`providerSelectOptions`），不写入仓库；
 - **审美顾问自检（v0.6.0）**：宿主半用 `tmp/wc-aesthetic-dev/host-smoke.mjs`（fake ctx + fake activation + 临时 `DSH_HOME`，覆盖默认配置/规范化/工具注册/参数 schema/execute 正常与覆盖/非 lead 拒绝/插件页关闭/`styleNotes` 生效/GET defaults/POST 回显）；浏览器半用 `tmp/wc-aesthetic-client/check.cjs`（fake React 物化配置卡片，覆盖 aesthetic 的解析/规范化/校验/字典键/渲染/保存载荷）。两个脚本都在 tmp 下、不进仓库，跑完不污染真实配置；
 - 配置接口：`GET/POST /plugin-api/work-chain/config`（同源，仅本机 Web 服务提供）。
-- **测试约定（2026-10-27 起，用户要求）**：插件改动的冒烟测试**只跑一个 `ds-flash` 成员**（`opencode-go/deepseek-v4.1-flash`），不再跑多模型/多成员/压测；单成员一次约 20~30s。命令形态：
+- **测试约定（2026-10-27 起，用户要求）**：插件改动的冒烟测试**只跑一个成员**（`opencode-go/deepseek-v4.1-flash`，成员名默认 `deepseek-v4-1-flash`），不再跑多模型/多成员/压测；单成员一次约 20~30s。命令形态：
 
   ```json
   { "mode": "rotate",
     "task": "冒烟测试：20 字内回答 1+1 并自报模型",
-    "members": [ { "name": "ds-flash", "provider": "opencode-go", "model": "deepseek-v4.1-flash" } ],
+    "members": [ { "name": "deepseek-v4-1-flash", "provider": "opencode-go", "model": "deepseek-v4.1-flash" } ],
     "timeout_seconds": 120 }
   ```
 

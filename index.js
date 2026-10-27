@@ -57,13 +57,54 @@ const DEFAULT_MODEL = 'deepseek-v4.1-flash'
 /** 读取单个供应商模型列表的超时，避免某个 provider 卡住整个目录。 */
 const CATALOG_TIMEOUT_MS = 8000
 
-/** 默认成员：都能在 DSH LLM 里路由的模型（2026-10-27 实测），默认统一全 flash。 */
-const DEFAULT_MEMBERS = Object.freeze([
-  { name: 'pro', provider: DEFAULT_PROVIDER, model: DEFAULT_MODEL },
-  { name: 'haiku', provider: DEFAULT_PROVIDER, model: DEFAULT_MODEL },
-  { name: 'kimi', provider: DEFAULT_PROVIDER, model: DEFAULT_MODEL },
-  { name: 'ds-flash', provider: DEFAULT_PROVIDER, model: DEFAULT_MODEL },
-])
+/** 成员名上限：内置 Agent Teams 要求 lower-kebab-case 且 ≤64 字符；给 -NN 后缀留出余量。 */
+const MEMBER_NAME_MAX = 64
+const MEMBER_NAME_SLUG_MAX = 48
+/** 旧版默认成员名（模型别名）；读取旧配置时迁移成模型名（v0.6.1）。 */
+const LEGACY_DEFAULT_MEMBER_NAMES = Object.freeze(['pro', 'haiku', 'kimi', 'ds-flash'])
+/** 配置命名版本：2 = 成员名默认由模型名生成；旧配置读入时自动迁移到 2。 */
+const CONFIG_NAMING_VERSION = 2
+
+/**
+ * 模型 id → 合法成员名。内置 Agent Teams 只接受 lower-kebab-case
+ * （^[a-z0-9]+(-[a-z0-9]+)*$，≤64 字符），所以 `deepseek-v4.1-flash` 会变成
+ * `deepseek-v4-1-flash`；中文/空格/下划线等非法字符一律折叠成单个 `-`。
+ */
+function modelMemberName(model) {
+  const slug = String(model ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/gu, '-')
+    .replace(/^-+|-+$/gu, '')
+    .slice(0, MEMBER_NAME_SLUG_MAX)
+    .replace(/-+$/gu, '')
+  return slug === '' ? 'member' : slug
+}
+
+/** 按模型名取不重复成员名：第一个用纯模型名，重名追加 -2、-3…（即二号、三号）。 */
+function memberNameFromModel(model, taken) {
+  const used = taken instanceof Set ? taken : new Set(taken ?? [])
+  const base = modelMemberName(model)
+  if (!used.has(base)) return base
+  for (let index = 2; index < 1000; index += 1) {
+    const candidate = `${base}-${index}`
+    if (!used.has(candidate)) return candidate
+  }
+  return `${base}-${Date.now()}`
+}
+
+/** 默认成员：4 个都跑 DEFAULT_MODEL，名字直接取模型名（重名按 -2、-3、-4 编号）。 */
+function defaultMembers() {
+  const taken = new Set()
+  return Array.from({ length: 4 }, () => {
+    const name = memberNameFromModel(DEFAULT_MODEL, taken)
+    taken.add(name)
+    return { name, provider: DEFAULT_PROVIDER, model: DEFAULT_MODEL }
+  })
+}
+
+/** 默认成员快照（只读；需要可变副本时调用 defaultMembers()）。 */
+const DEFAULT_MEMBERS = Object.freeze(defaultMembers())
 
 const MEMBER_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u
 const CONFIG_ROUTE = '/plugin-api/work-chain/config'
@@ -112,16 +153,20 @@ function normalizeMembers(input) {
   const members = []
   for (const [index, raw] of input.entries()) {
     if (raw === null || typeof raw !== 'object') throw new Error(`members[${index}] 必须是对象`)
-    const memberName = typeof raw.name === 'string' ? raw.name.trim() : ''
+    const rawName = typeof raw.name === 'string' ? raw.name.trim() : ''
     const provider = typeof raw.provider === 'string' ? raw.provider.trim() : ''
     const model = typeof raw.model === 'string' ? raw.model.trim() : ''
-    if (!MEMBER_NAME.test(memberName)) {
-      throw new Error(`members[${index}].name 必须是 lower-kebab-case（^[a-z0-9]+(-[a-z0-9]+)*$），收到 ${JSON.stringify(raw.name)}`)
+    if (provider.length === 0) throw new Error(`members[${index}].provider 不能为空`)
+    if (model.length === 0) throw new Error(`members[${index}].model 不能为空`)
+    // v0.6.1：名字留空 = 默认取模型名（重名自动 -2、-3…）。
+    const memberName = rawName === '' ? memberNameFromModel(model, seen) : rawName
+    if (!MEMBER_NAME.test(memberName) || memberName.length > MEMBER_NAME_MAX) {
+      throw new Error(
+        `members[${index}].name 必须是 lower-kebab-case（^[a-z0-9]+(-[a-z0-9]+)*$，≤${MEMBER_NAME_MAX} 字符），收到 ${JSON.stringify(raw.name)}`,
+      )
     }
     if (seen.has(memberName)) throw new Error(`成员名重复：${memberName}`)
     seen.add(memberName)
-    if (provider.length === 0) throw new Error(`members[${index}].provider 不能为空`)
-    if (model.length === 0) throw new Error(`members[${index}].model 不能为空`)
     members.push({ name: memberName, provider, model })
   }
   if (members.length === 0) throw new Error('至少配置一个成员')
@@ -146,12 +191,13 @@ function normalizeAesthetic(input) {
 
 function defaultConfig() {
   return {
-    members: DEFAULT_MEMBERS.map((member) => ({ ...member })),
+    members: defaultMembers(),
     mode: 'rotate',
     workflowMode: false,
     maxParallel: 4,
     timeoutSeconds: 600,
     aesthetic: defaultAesthetic(),
+    namingVersion: CONFIG_NAMING_VERSION,
   }
 }
 
@@ -165,14 +211,35 @@ function normalizeConfig(input) {
     maxParallel: clampInteger(source.maxParallel, 4, 1, 8),
     timeoutSeconds: clampInteger(source.timeoutSeconds, 600, 30, 3600),
     aesthetic: normalizeAesthetic(source.aesthetic),
+    // 旧配置没有这个字段（=1）：readConfig 会把旧默认成员名迁移成模型名。
+    namingVersion: Number.isFinite(Number(source.namingVersion)) ? Math.trunc(Number(source.namingVersion)) : 1,
   }
 }
 
-/** 读取有效配置；team 模式的成员数在调用时按当前智能体上限截断。 */
+/**
+ * 旧配置迁移（v0.6.1）：早期默认成员名 pro/haiku/kimi/ds-flash 与真正调用的模型对不上，
+ * 读配置时统一改成模型名（重名 -2、-3…）。迁移幂等，返回带 namingVersion=2 的配置。
+ */
+function migrateMemberNames(config) {
+  if (config.namingVersion >= CONFIG_NAMING_VERSION) return config
+  const legacy = new Set(LEGACY_DEFAULT_MEMBER_NAMES)
+  const taken = new Set(
+    config.members.filter((member) => !legacy.has(member.name)).map((member) => member.name),
+  )
+  const members = config.members.map((member) => {
+    if (!legacy.has(member.name)) return member
+    const name = memberNameFromModel(member.model, taken)
+    taken.add(name)
+    return { ...member, name }
+  })
+  return { ...config, members, namingVersion: CONFIG_NAMING_VERSION }
+}
+
+/** 读取有效配置；旧版别名成员名在读取时迁移成模型名。team 模式的成员数在调用时按当前智能体上限截断。 */
 function readConfig() {
   try {
     const text = fs.readFileSync(configFile(), 'utf8')
-    return normalizeConfig(JSON.parse(text))
+    return migrateMemberNames(normalizeConfig(JSON.parse(text)))
   } catch {
     return defaultConfig()
   }
@@ -540,9 +607,14 @@ function installConfigRoute(ctx) {
           const body = await readJsonBody(req)
           const current = readConfig()
           const incoming = body?.config !== null && typeof body?.config === 'object' ? body.config : {}
-          // 保存成员/模式等配置时保留「工作流模式」开关（配置页不一定提交该字段）。
+          // 保存成员/模式等配置时保留「工作流模式」开关与命名版本（配置页不一定提交这两个字段）。
           const config = normalizeConfig({
             ...incoming,
+            // 客户端不提交 namingVersion：始终保留当前（已迁移）版本，避免被旧客户端降回 1。
+            namingVersion: Math.max(
+              Number.isFinite(Number(incoming.namingVersion)) ? Math.trunc(Number(incoming.namingVersion)) : 0,
+              current.namingVersion,
+            ),
             workflowMode: incoming.workflowMode ?? current.workflowMode,
           })
           writeConfig(config)
@@ -2077,12 +2149,17 @@ export {
   inject,
   apply,
   CONFIG_ROUTE,
+  CONFIG_NAMING_VERSION,
   DEFAULT_MEMBERS,
   DEFAULT_PROVIDER,
   DEFAULT_MODEL,
   GO_MODELS,
   RUNS_DIR_NAME,
   AESTHETIC_DIR_NAME,
+  modelMemberName,
+  memberNameFromModel,
+  defaultMembers,
+  migrateMemberNames,
   readConfig,
   writeConfig,
   defaultConfig,

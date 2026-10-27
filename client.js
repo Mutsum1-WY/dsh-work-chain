@@ -75,6 +75,44 @@ window.__ModuleLoader__.load({
     ]);
     /** 宿主半 index.js 的 MEMBER_NAME；客户端提前校验以便即时提示。 */
     const MEMBER_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
+    /** DSH Agent Teams 的成员名上限是 64 字符；自动命名给 -NN 后缀留出余量。 */
+    const MEMBER_NAME_MAX = 64;
+    const MEMBER_NAME_SLUG_MAX = 48;
+
+    /**
+     * 模型 id → 合法成员名（与宿主 index.js 的 modelMemberName 同算法）。
+     * DSH 队友名只接受 lower-kebab-case，所以 `deepseek-v4.1-flash` → `deepseek-v4-1-flash`。
+     */
+    function modelMemberName(model) {
+      const slug = String(model ?? '')
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/gu, '-')
+        .replace(/^-+|-+$/gu, '')
+        .slice(0, MEMBER_NAME_SLUG_MAX)
+        .replace(/-+$/gu, '');
+      return slug === '' ? 'member' : slug;
+    }
+
+    /** 名字是否由该模型自动生成（纯模型名或 -2、-3… 重名后缀），用于切换模型时自动跟随改名。 */
+    function isAutoMemberName(name, model) {
+      const base = modelMemberName(model);
+      if (name === base) return true;
+      const match = /^(.*)-(\d+)$/u.exec(name);
+      return match !== null && match[1] === base && Number(match[2]) >= 2;
+    }
+
+    /** 按模型名给新成员取不重复名字：优先纯模型名，重名追加 -2、-3…（即二号、三号）。 */
+    function nextMemberNameForModel(members, model) {
+      const taken = new Set(members.map((member) => member.name));
+      const base = modelMemberName(model);
+      if (!taken.has(base)) return base;
+      for (let index = 2; index < 1000; index += 1) {
+        const candidate = `${base}-${index}`;
+        if (!taken.has(candidate)) return candidate;
+      }
+      return `${base}-${Date.now()}`;
+    }
     /**
      * 输入范围：与宿主半 index.js（v0.2.0）对齐。
      * - members：rotate 模式固定最多 16（host 轮换一次最多跑 16 个）；team 模式的
@@ -471,7 +509,7 @@ window.__ModuleLoader__.load({
       workflowError: '工作流模式不可用',
       membersTitle: '成员',
       membersHint:
-        'name 用 lower-kebab-case（如 writer-1）且不能重复；provider / model 从 DSH 当前已配置的供应商与模型下拉选择（默认 deepseek-v4.1-flash）。',
+        '成员名默认取所选模型名（deepseek-v4.1-flash → deepseek-v4-1-flash，DSH 队友名只接受 lower-kebab-case），重名自动编号 -2、-3…；provider / model 从 DSH 当前已配置的供应商与模型下拉选择（默认 deepseek-v4.1-flash）。',
       providerDetected:
         '已从 DSH 检测到 {count} 个模型供应商；provider / model 用下拉选择，默认模型 deepseek-v4.1-flash。',
       providerUnavailable:
@@ -488,7 +526,7 @@ window.__ModuleLoader__.load({
       nameLabel: '成员名',
       providerLabel: 'Provider',
       modelLabel: 'Model',
-      namePlaceholder: '例如 writer-1',
+      namePlaceholder: '默认＝模型名，如 deepseek-v4-1-flash',
       providerPlaceholder: 'opencode-go',
       modelPlaceholder: '输入或从建议中选择',
       emptyMembers: '还没有成员，点「添加成员」开始配置。',
@@ -533,7 +571,7 @@ window.__ModuleLoader__.load({
       rotateMemberLimitReached:
         '轮换模式最多 {max} 个成员（每批 min(maxParallel, 8) 个，跑完即释放），请删行。',
       invalidNameEmpty: '成员名不能为空',
-      invalidNameFormat: '成员名需为小写 kebab-case（例如 writer-1）',
+      invalidNameFormat: '成员名需为小写 kebab-case 且 ≤64 字符（例如 deepseek-v4-1-flash）',
       invalidNameDuplicate: '成员名重复',
       invalidProvider: 'provider 不能为空',
       invalidModel: 'model 不能为空',
@@ -570,7 +608,7 @@ window.__ModuleLoader__.load({
       workflowError: 'Workflow mode is unavailable',
       membersTitle: 'Members',
       membersHint:
-        'Use unique lower-kebab-case names (e.g. writer-1); pick provider / model from the providers and models configured in DSH (default: deepseek-v4.1-flash).',
+        'Names default to the selected model name (deepseek-v4.1-flash → deepseek-v4-1-flash; DSH teammate names must be lower-kebab-case); duplicate names get -2, -3… automatically. Pick provider / model from the providers and models configured in DSH (default: deepseek-v4.1-flash).',
       providerDetected:
         'Detected {count} model providers from DSH; pick provider / model from the dropdowns (default model: deepseek-v4.1-flash).',
       providerUnavailable:
@@ -587,7 +625,7 @@ window.__ModuleLoader__.load({
       nameLabel: 'Name',
       providerLabel: 'Provider',
       modelLabel: 'Model',
-      namePlaceholder: 'e.g. writer-1',
+      namePlaceholder: 'defaults to the model name, e.g. deepseek-v4-1-flash',
       providerPlaceholder: 'opencode-go',
       modelPlaceholder: 'Type or pick a suggestion',
       emptyMembers: 'No members yet. Use "Add member" to start.',
@@ -634,7 +672,7 @@ window.__ModuleLoader__.load({
       rotateMemberLimitReached:
         'Rotate mode supports up to {max} members (each wave runs min(maxParallel, 8) and releases them when done); remove rows.',
       invalidNameEmpty: 'A member name is required',
-      invalidNameFormat: 'Use a lower-kebab-case name (e.g. writer-1)',
+      invalidNameFormat: 'Use a lower-kebab-case name of at most 64 characters (e.g. deepseek-v4-1-flash)',
       invalidNameDuplicate: 'Duplicate member name',
       invalidProvider: 'Provider is required',
       invalidModel: 'Model is required',
@@ -1050,7 +1088,9 @@ window.__ModuleLoader__.load({
       }
       return members.map((member) => {
         if (member.name.trim() === '') return 'invalidNameEmpty';
-        if (!MEMBER_NAME.test(member.name)) return 'invalidNameFormat';
+        if (!MEMBER_NAME.test(member.name) || member.name.length > MEMBER_NAME_MAX) {
+          return 'invalidNameFormat';
+        }
         if ((counts.get(member.name) ?? 0) > 1) return 'invalidNameDuplicate';
         if (String(member.provider).trim() === '') return 'invalidProvider';
         if (String(member.model).trim() === '') return 'invalidModel';
@@ -1109,16 +1149,6 @@ window.__ModuleLoader__.load({
       const aestheticIssue = computeAestheticIssues(draft.aesthetic);
       if (aestheticIssue !== null) issues.push(t(aestheticIssue));
       return issues;
-    }
-
-    /** 生成一个未被占用的默认成员名（worker-1、worker-2…）。 */
-    function nextMemberName(members) {
-      const taken = new Set(members.map((member) => member.name));
-      for (let index = 1; index < 100; index += 1) {
-        const candidate = `worker-${index}`;
-        if (!taken.has(candidate)) return candidate;
-      }
-      return `worker-${Date.now()}`;
     }
 
     /** 错误码 → 可读文本（带宿主 detail）。 */
@@ -1519,9 +1549,24 @@ window.__ModuleLoader__.load({
           ...previous,
           members: previous.members.map((member, position) => {
             if (position !== index) return member;
+            const others = previous.members.filter((_row, rowIndex) => rowIndex !== index);
             if (field === 'provider') {
               const picked = pickModelForProvider(catalog.groups, value, member.model);
-              return { ...member, provider: value, ...(picked === '' ? {} : { model: picked }) };
+              const nextModel = picked === '' ? member.model : picked;
+              const next = { ...member, provider: value, model: nextModel };
+              // v0.6.1：自动生成的名字跟着模型走；手填的名字保持不动。
+              if (nextModel !== member.model && isAutoMemberName(member.name, member.model)) {
+                next.name = nextMemberNameForModel(others, nextModel);
+              }
+              return next;
+            }
+            if (field === 'model') {
+              const next = { ...member, model: value };
+              // 清空模型输入框时不改名（空模型会被 invalidModel 拦住，名字保持原样更不扰人）。
+              if (value.trim() !== '' && value !== member.model && isAutoMemberName(member.name, member.model)) {
+                next.name = nextMemberNameForModel(others, value);
+              }
+              return next;
             }
             return { ...member, [field]: value };
           }),
@@ -1544,7 +1589,8 @@ window.__ModuleLoader__.load({
             members: [
               ...previous.members,
               {
-                name: nextMemberName(previous.members),
+                // v0.6.1：新增行的名字默认＝所选模型名；重名自动 -2、-3…（即二号、三号）。
+                name: nextMemberNameForModel(previous.members, model),
                 provider,
                 model,
               },
@@ -2070,6 +2116,10 @@ window.__ModuleLoader__.load({
       capacityText,
       sameTeam,
       normalizeMode,
+      modelMemberName,
+      isAutoMemberName,
+      nextMemberNameForModel,
+      MEMBER_NAME_MAX,
       toDraft,
       toWireConfig,
       computeMemberIssues,
