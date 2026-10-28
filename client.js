@@ -11,6 +11,10 @@
 // v0.7.0：移除 rotate（一次性子代理轮换）模式，只保留 team 模式（常驻 Agent Teams
 // 队友）；配置卡片不再有「成员模式」选择，config 里的 mode 字段也不再使用。
 //
+// v0.8.0：审美顾问算进可调用成员——启用后成员区多一行只读的虚拟成员 `aesthetic`
+// （不占智能体槽位，成员计数含它），提示可用 subtasks[].member / tasks[].member 点名；
+// 成员名 aesthetic 保留给虚拟成员，普通成员不能重名。
+//
 // 客户端模块系统（window.__ModuleLoader__）只登记 factory，物化时才执行闭包；factory
 // 返回 { apply, inject }，内核把它当客户端插件挂载。浏览器模块 id 必须等于包名。
 //
@@ -78,6 +82,8 @@ window.__ModuleLoader__.load({
     ]);
     /** 宿主半 index.js 的 MEMBER_NAME；客户端提前校验以便即时提示。 */
     const MEMBER_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u;
+    /** 内置审美顾问虚拟成员名（宿主 index.js 的 AESTHETIC_MEMBER_NAME）。 */
+    const AESTHETIC_MEMBER_NAME = 'aesthetic';
     /** DSH Agent Teams 的成员名上限是 64 字符；自动命名给 -NN 后缀留出余量。 */
     const MEMBER_NAME_MAX = 64;
     const MEMBER_NAME_SLUG_MAX = 48;
@@ -484,7 +490,12 @@ window.__ModuleLoader__.load({
       providerPartial: '{count} 个供应商暂时不可用：{names}',
       providerCurrentOption: '当前值',
       membersCount: '共 {count} 个',
+      membersCountWithAesthetic: '共 {count} 个（含审美顾问）',
       membersLimitHint: '最多 {max} 个',
+      virtualMemberLabel: '审美顾问',
+      virtualMemberBadge: '内置虚拟成员 · 不占槽位',
+      virtualMemberHint:
+        '审美顾问也计入可调用成员（成员名 aesthetic，不占智能体槽位）：在 work_chain 的 subtasks[].member 或 work_flow 的 tasks[].member 里写 "aesthetic" 即可点名派活；不点名时不会自动跑。',
       addMember: '添加成员',
       remove: '删除',
       removeLabel: '删除该成员',
@@ -503,7 +514,7 @@ window.__ModuleLoader__.load({
       timeoutSecondsHint: '30~3600，单个成员任务的超时时间',
       aestheticTitle: '审美顾问',
       aestheticHint:
-        '独立审美顾问：默认 deepseek-v4.1-flash；leader 用 aesthetic_advice 工具随时征询审美建议，建议只回给 leader，由 leader 决定采纳。',
+        '独立审美顾问：默认 deepseek-v4.1-flash；既可用 aesthetic_advice 工具随时征询，也作为可调用成员 aesthetic 参与 work_chain / work_flow 派活（不占智能体槽位，按需点名才跑）。',
       aestheticEnabled: '启用审美顾问',
       aestheticEnabledHint: '关闭后 leader 调用会提示到插件页开启。',
       aestheticProviderLabel: '审美模型供应商',
@@ -535,6 +546,7 @@ window.__ModuleLoader__.load({
       memberLimitReached: '设置里的智能体上限是 {max}，请到设置调大或删行。',
       invalidNameEmpty: '成员名不能为空',
       invalidNameFormat: '成员名需为小写 kebab-case 且 ≤64 字符（例如 deepseek-v4-1-flash）',
+      invalidNameReserved: '成员名 aesthetic 是内置审美顾问虚拟成员，请改用其它名字',
       invalidNameDuplicate: '成员名重复',
       invalidProvider: 'provider 不能为空',
       invalidModel: 'model 不能为空',
@@ -573,7 +585,12 @@ window.__ModuleLoader__.load({
       providerPartial: '{count} providers are temporarily unavailable: {names}',
       providerCurrentOption: 'current value',
       membersCount: '{count} total',
+      membersCountWithAesthetic: '{count} total (incl. aesthetic advisor)',
       membersLimitHint: 'up to {max}',
+      virtualMemberLabel: 'Aesthetic advisor',
+      virtualMemberBadge: 'built-in virtual member · no team slot',
+      virtualMemberHint:
+        'The aesthetic advisor also counts as a callable member named "aesthetic" (no team slot): set subtasks[].member in work_chain or tasks[].member in work_flow to "aesthetic" to dispatch to it; it never runs unless named.',
       addMember: 'Add member',
       remove: 'Remove',
       removeLabel: 'Remove this member',
@@ -592,7 +609,7 @@ window.__ModuleLoader__.load({
       timeoutSecondsHint: '30–3600, budget for one member task',
       aestheticTitle: 'Aesthetic advisor',
       aestheticHint:
-        'A dedicated aesthetic advisor (default: deepseek-v4.1-flash); the leader can consult it anytime with the aesthetic_advice tool, and the advice goes only to the leader, who decides what to adopt.',
+        'A dedicated aesthetic advisor (default: deepseek-v4.1-flash); consult it anytime with the aesthetic_advice tool, or let it join work_chain / work_flow as the callable virtual member "aesthetic" (no team slot, only runs when named).',
       aestheticEnabled: 'Enable the aesthetic advisor',
       aestheticEnabledHint: 'When off, a leader call reports that it must be enabled on this plugin page.',
       aestheticProviderLabel: 'Aesthetic provider',
@@ -626,6 +643,7 @@ window.__ModuleLoader__.load({
       memberLimitReached: 'The agent limit in settings is {max}; raise it there or remove rows.',
       invalidNameEmpty: 'A member name is required',
       invalidNameFormat: 'Use a lower-kebab-case name of at most 64 characters (e.g. deepseek-v4-1-flash)',
+      invalidNameReserved: 'The name "aesthetic" belongs to the built-in aesthetic advisor virtual member; pick another name',
       invalidNameDuplicate: 'Duplicate member name',
       invalidProvider: 'Provider is required',
       invalidModel: 'Model is required',
@@ -1032,6 +1050,7 @@ window.__ModuleLoader__.load({
         if (!MEMBER_NAME.test(member.name) || member.name.length > MEMBER_NAME_MAX) {
           return 'invalidNameFormat';
         }
+        if (member.name === AESTHETIC_MEMBER_NAME) return 'invalidNameReserved';
         if ((counts.get(member.name) ?? 0) > 1) return 'invalidNameDuplicate';
         if (String(member.provider).trim() === '') return 'invalidProvider';
         if (String(member.model).trim() === '') return 'invalidModel';
@@ -1673,11 +1692,20 @@ window.__ModuleLoader__.load({
             'div',
             { style: STYLE.sectionTitle },
             t('membersTitle'),
-            h('span', { style: STYLE.sectionMeta }, `  ${t('membersCount', { count: String(draft.members.length) })}`),
+            h(
+              'span',
+              { style: STYLE.sectionMeta },
+              `  ${
+                draft.aesthetic.enabled === true
+                  ? t('membersCountWithAesthetic', { count: String(draft.members.length + 1) })
+                  : t('membersCount', { count: String(draft.members.length) })
+              }`,
+            ),
           ),
           h('span', { style: STYLE.sectionMeta }, t('membersLimitHint', { max: String(memberLimit) })),
         ),
         h('div', { style: STYLE.hint }, t('membersHint')),
+        draft.aesthetic.enabled === true ? h('div', { style: STYLE.hint }, t('virtualMemberHint')) : null,
         useSelect
           ? null
           : h('div', { style: STYLE.hint }, t('providerUnavailable')),
@@ -1728,6 +1756,21 @@ window.__ModuleLoader__.load({
                   },
                 }),
               ),
+              draft.aesthetic.enabled === true
+                ? h(
+                    'div',
+                    { key: 'virtual-aesthetic', style: STYLE.row, 'data-work-chain-virtual-member': true },
+                    h(
+                      'div',
+                      { style: STYLE.cell },
+                      h('span', { style: { fontSize: 12.5, fontWeight: 600 } }, AESTHETIC_MEMBER_NAME),
+                      h('span', { style: STYLE.hintFaint }, t('virtualMemberLabel')),
+                    ),
+                    h('div', { style: STYLE.cell }, h('span', { style: STYLE.hint }, draft.aesthetic.provider)),
+                    h('div', { style: STYLE.cell }, h('span', { style: STYLE.hint }, draft.aesthetic.model)),
+                    h('div', { style: STYLE.cellAction }, h('span', { style: STYLE.hintFaint }, t('virtualMemberBadge'))),
+                  )
+                : null,
             ),
         useSelect
           ? null

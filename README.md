@@ -10,6 +10,8 @@
 
 > **v0.7.0 移除 rotate 模式**：只保留 `team`（常驻 Agent Teams 队友）模式。插件页不再有「成员模式」选择，`work_chain` 也没有 `mode` 参数；旧配置里的 `mode` 字段会被忽略。想让成员并行更多就调大设置里的智能体上限，或新开一个对话重置槽位。升级后**刷新一次插件页**（旧缓存页面可能还显示模式单选，它提交的 `mode` 会被新宿主忽略）。
 
+> **v0.8.0 审美顾问算进可调用成员**：启用审美顾问后，它以固定名字 **`aesthetic`** 出现在可调用成员里（插件页成员区会多一行，成员计数含它），**不占团队智能体槽位**。`work_chain` 里用 `subtasks[].member: "aesthetic"`、`work_flow` 里用 `tasks[].member: "aesthetic"` 就能把任务派给它；不点名时不会自动跑。详见下文「审美顾问」与「成员生命周期」。
+
 ## 它怎么工作（一句话版）
 
 1. 你在顶栏把当前会话切到想当 leader 的模型；
@@ -175,7 +177,22 @@ agent 会调用：
 }
 ```
 
-调用返回：`runId`、`team{maxMembers, limitSource, usedBefore, reused, skipped}`、`notes`、每个成员的 `taskId/状态/摘要/结果文件内容`、是否超时、耗时；leader 据此做最终汇总。成员结果文件在 `<cwd>/.workchain/<runId>/`。
+调用返回：`runId`、`team{maxMembers, limitSource, usedBefore, reused, skipped, virtualMembers}`、`notes`、每个成员的 `taskId/状态/摘要/结果文件内容`、是否超时、耗时；leader 据此做最终汇总。成员结果文件在 `<cwd>/.workchain/<runId>/`；审美顾问（虚拟成员 `aesthetic`）的建议写到 `<cwd>/.aesthetic/<runId>/advice.md`。
+
+审美顾问也可以像普通成员一样派活（v0.8.0，启用审美顾问时）：
+
+```json
+{
+  "task": "把首页视觉打磨一遍",
+  "subtasks": [
+    { "title": "审美评审", "prompt": "评审 apps/web/dist/index.html 的配色、间距与字号层级，给 3~5 条具体建议", "member": "aesthetic" },
+    { "title": "实现", "prompt": "根据评审建议修改样式", "member": "deepseek-v4-1-flash" }
+  ],
+  "timeout_seconds": 300
+}
+```
+
+`subtasks[].member` 写成员名就会点名派给该成员；不写则按顺序补给剩余成员。`aesthetic` 是虚拟成员：宿主直接拉起一次性审美子代理，不占团队智能体槽位，任务板任务由宿主写回摘要并结算。
 
 ## 对话页「工作流模式」开关
 
@@ -204,13 +221,16 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
   "task": "给项目做上线前整改",
   "tasks": [
     { "key": "audit", "title": "安全审计", "prompt": "审查鉴权/注入/依赖风险" },
-    { "key": "fix",   "title": "整改建议", "prompt": "根据审计结果给整改清单", "depends_on": ["audit"] }
+    { "key": "fix",   "title": "整改建议", "prompt": "根据审计结果给整改清单", "depends_on": ["audit"] },
+    { "key": "visual", "title": "审美评审", "prompt": "评审首页视觉，给具体修改建议", "member": "aesthetic" }
   ],
   "members": [ { "name": "deepseek-v4-pro", "provider": "opencode-go", "model": "deepseek-v4-pro" } ],
   "wait_seconds": 120,
   "max_assign": 2
 }
 ```
+
+`tasks[].member`（v0.8.0）：点名派给某个成员（写 `"aesthetic"` 即审美顾问虚拟成员；它不占槽位、同时只跑一个审美任务）。不写则任意空闲 worker 先到先得；点名了但该成员不在池里时会退回普通派发并记一条 `notes`。
 
 返回值要点：`assigned`（本轮派发）、`completedNow`（**本轮完成、待你验收**）、`remaining`（待办/进行中）、`counts`、`workers`、`done`、`notes`。下一轮把验收意见变成新任务再调一次即可。
 
@@ -220,6 +240,7 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 ### 成员生命周期与智能体数量
 
 - 成员都是常驻 Agent Teams teammate：出现在团队 UI、能读写任务板、跨调用同名复用；数量受**设置里的智能体上限**约束，槽位不足时跳过并报告。
+- **虚拟成员 `aesthetic`（v0.8.0）**：启用审美顾问时自动算进「可调用成员」列表（插件页成员区多一行、成员计数含它），但**不是 teammate、不占智能体槽位、不出现在团队名册**；派活时由宿主直接拉起一次性审美子代理，任务板任务由宿主 claim 后写摘要并 complete。同一时刻只跑一个审美任务。
 - 实时读取内置团队当前生效的 `maxMembers`（`runtime` = 运行中团队服务，设置改动热更新后立即跟随；退回 `config` 读 agent-team 配置行；最后回退 8）。
 - 规划顺序：同名 teammate 直接复用（不占新槽位）→ 还有空槽就按该成员模型新建 → 槽位已满则该成员**跳过并报告**（不换模型、不挪用其它成员）。
 - 槽位不够时：**新开一个对话**（团队成员从 0 开始），或到**设置**里把智能体上限调大；插件下一次调用/保存即跟随。
@@ -233,9 +254,9 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 | 同上 | `namingVersion` | 配置命名版本（v0.6.1）：`2` = 成员名由模型名生成；旧配置缺该字段时读入自动迁移并补成 `2` |
 | 同上 | `maxParallel` | 1~8：`work_flow` 每轮默认派活的成员数（可通过 `max_assign` 覆盖） |
 | 同上 | `timeoutSeconds` | 30~3600，整条链的总等待预算（默认 600 秒） |
-| 同上 | `aesthetic` | `{enabled, provider, model, styleNotes}`（v0.6.0 审美顾问）：默认 `true` / `opencode-go` / `deepseek-v4.1-flash` / `''`；`styleNotes` 是拼进审美顾问提示词的偏好文本，保存时截到 **4000 字**；`enabled` 只在显式 `false` 时关闭 |
-| `work_chain` 参数 | `members` | 本次调用临时覆盖成员 |
-| 同上 | `subtasks[]` | leader 拆好的分工；不传则每个成员独立做总任务 |
+| 同上 | `aesthetic` | `{enabled, provider, model, styleNotes}`（v0.6.0 审美顾问）：默认 `true` / `opencode-go` / `deepseek-v4.1-flash` / `''`；启用时同时作为可调用虚拟成员 `aesthetic`（v0.8.0，不占槽位）；`styleNotes` 是拼进审美顾问提示词的偏好文本，保存时截到 **4000 字**；`enabled` 只在显式 `false` 时关闭 |
+| `work_chain` 参数 | `members` | 本次调用临时覆盖成员；含 `{name:"aesthetic"}` 时加入审美顾问虚拟成员 |
+| 同上 | `subtasks[]` | leader 拆好的分工；`subtasks[].member` 可按成员名点名（写 `aesthetic` 派给审美顾问） |
 | 同上 | `timeout_seconds` | 本次调用覆盖等待预算 |
 
 ### 成员复用
@@ -254,6 +275,15 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 - **一次性子代理**：每次调用新建、跑完即释放（不进团队名册、不占团队常驻槽位）；评审过程可能用到文件/截图/浏览器等工具，默认 180 秒预算，到点硬中断并返回已落盘的部分建议；
 - **leader 专用**：只有 Team Lead 能调用，teammate 调用会报「只能由 Team Lead 调用」；什么时候审、审完要不要采纳、这次用哪个模型，都由 leader（当前会话）决定；
 - **受插件页配置控制**：启用开关关闭时调用会直接报错并提示去插件页开启；默认模型 `opencode-go` / `deepseek-v4.1-flash`，可在配置卡片改；「审美偏好 / 标准」会拼进它的提示词（留空则只用通用标准）。
+
+### 作为可调用成员（v0.8.0）
+
+启用审美顾问后，它在可调用成员里以固定名字 **`aesthetic`** 出现（插件页成员区多一行只读成员，成员计数含它），**不占团队智能体槽位**。点名才会跑：
+
+- **`work_chain`**：`subtasks[].member` 写 `"aesthetic"`，可与其他成员混用；`prompt` 会作为审美评审的待审对象（target），总任务作为背景（context）；建议写到 `.aesthetic/<runId>/advice.md`，任务板任务由宿主写摘要并 complete。
+- **`work_flow`**：`tasks[].member` 写 `"aesthetic"`；宿主在常驻 worker 之外单独执行这个审美任务（同时只跑一个），建议写到 `.workflow/<flowRun>/<taskId>.md`，完成后作为 `completedNow` 返回（owner 显示 `aesthetic`）。
+- `members` 参数里也可以写一项 `{ "name": "aesthetic" }`（provider/model 会用插件页「审美顾问」的配置），表示本次调用确保虚拟成员在册。
+- 不点名时不会自动跑；单独的 `aesthetic_advice` 工具用法不受影响。
 
 ### 参数
 
@@ -312,6 +342,7 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 - **任务板**：每次 `work_chain` 会为每个成员建一条团队任务（subject=分工标题）。成员 claim → 编辑 description 写摘要 → complete，进度在团队任务板里可见；派活失败的任务会被删除，避免留下永远 pending 的脏任务。
 - **结果文件**：成员把完整 Markdown 写在 `.workchain/<runId>/<member>.md`（工具输出会读回；太长会截断，完整内容看文件）。
 - **审美建议文件（v0.6.0）**：`aesthetic_advice` 的建议写在 `<cwd>/.aesthetic/<runId>/advice.md`，不经过团队任务板；工具输出给 leader 的是「首行路由/用时/文件路径 + 建议正文」。完整内容看文件。
+- **审美顾问虚拟成员（v0.8.0）**：`work_chain` 里点名 `aesthetic` 的任务，任务板仍会建一条任务（可见进度），由宿主 claim → 写摘要 → complete；结果按 `completed` 计。`work_flow` 里点名 `aesthetic` 的任务结果文件在 `.workflow/<flowRun>/<taskId>.md`。
 - **超时**：到 `timeoutSeconds` 仍未完成会返回 `timedOut: true` 并打断仍在运行的成员，已完成的成员结果照常返回。
 
 ## 排障
@@ -325,6 +356,9 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 | `aesthetic_advice` 报「审美顾问已在插件页关闭」（v0.6.0） | 到「插件」页 → 工作链配置卡片的「审美顾问」栏勾上「启用审美顾问」并保存，然后重新调用；也可检查 `config.json` 里 `aesthetic.enabled` 是否为 `true` |
 | `aesthetic_advice` 报「只能由 Team Lead 调用」（v0.6.0） | 当前会话不是 Lead（是 teammate/子代理）：换成由你发起的会话（那就是 Lead）再调用 |
 | `aesthetic_advice` 返回 `timedOut: true` / 报「审美顾问调用失败」 | 模型不可路由（provider 无凭据）或超时：在配置卡片换一个可路由的审美模型，或把 `timeout_seconds` 调大（30~600）；`error` 字段里是原始错误 |
+| `work_chain` 报「审美顾问未启用」（v0.8.0） | 在 `subtasks[].member` / `members` 里点名了 `aesthetic`，但插件页「审美顾问」开关是关闭的：开启后重试，或去掉点名 |
+| 点名 `aesthetic` 的任务一直 pending（v0.8.0） | 任务板只允许 `in_progress` 的任务 complete；v0.8.0 会由宿主先 claim 再写摘要/complete。若仍卡住：确认组合包已重载到 v0.8.0，必要时在任务板手动 claim → complete |
+| 点名 `aesthetic` 的成员提示「审美顾问超时」 | 审美子代理到预算上限被硬中断：已写进 advice/结果文件的部分建议照常返回，任务仍会结算；把链的 `timeout_seconds` 或单次审美预算调大（≤600） |
 | 某个成员 spawn 失败 | 模型/provider 在该会话不可用（`opencode-go` 需要有效凭据）；在配置里换模型后重试；错误会写进该成员条目 |
 | 全部成员都没跑起来 | 看 `list_bundles` 的 `subagent-spawn-in-process` 行是否活跃；设置里的智能体上限是否已满（默认 8） |
 | 结果文件缺失但任务完成 | 成员偷懒没写文件；摘要仍在任务板里，工具输出会标 `结果文件缺失` |
@@ -354,6 +388,7 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 
   只有改动涉及多成员调度（复用/借用/任务板结算）时，才按需补一次多成员测试。
 
-- 审美顾问的真机验证不需要成员：一次 `aesthetic_advice` 调用即可（`target` 传一个本地文件路径，`timeout_seconds` 给 60~120），它不占团队常驻槽位；上面的 fake ctx 冒烟脚本本身不消耗模型额度。
+- **虚拟成员自检（v0.8.0）**：可以用 fake ctx + fake Agent Teams/subagents 的一次性脚本覆盖：`aestheticMember`/`callableMembers`/`normalizeMemberOverride`/`assignSubtasks` 纯函数，`work_chain` 点名 `aesthetic`（不 spawn teammate、任务板 claim→编辑→complete、结果在 `.aesthetic/`），`work_flow` 点名 `aesthetic`（虚拟 worker、`completedNow` owner=aesthetic、`done:true`），以及审美顾问关闭时点名报错。脚本只放临时目录、不提交仓库。
+- 审美顾问的真机验证不需要成员：一次 `aesthetic_advice` 调用即可（`target` 传一个本地文件路径，`timeout_seconds` 给 60~120），它不占团队常驻槽位；虚拟成员 `aesthetic` 也可以单独点名跑一条 `work_chain`/`work_flow` 任务验证（同样不占槽位）。
 
 MIT License，见 `LICENSE`。第三方插件形态与 `dsh-web-search-opencode` 一致，安装/卸载都走插件管理器。

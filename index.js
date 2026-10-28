@@ -18,6 +18,10 @@
  * - **插件页 GUI 配置**：`client.js` 注册 `plugins.bundle.config` 页面，通过同源 HTTP 路由
  *   `/plugin-api/work-chain/config` 读写 members 配置；配置文件落在
  *   `$DSH_HOME/work-chain/config.json`，改完下一次调用即生效（无需重启）。
+ * - **审美顾问也是可调用成员（v0.8.0）**：启用审美顾问后，它以虚拟成员 `aesthetic` 计入可调用
+ *   成员（插件页成员区只读一行、成员计数含它，不占团队智能体槽位）；`work_chain` 的
+ *   `subtasks[].member` 或 `work_flow` 的 `tasks[].member` 写 `aesthetic` 即点名派活，
+ *   宿主直接拉起一次性审美子代理并把摘要写回任务板，不点名不会跑。
  *
  * 第三方插件约束：本文件不 import 任何 `@deepseek-ai/*` 包，只用 Node 内置模块。
  * 核心依赖的是运行时 service 契约（tools / subagents / agentTeams / webServer）。
@@ -113,6 +117,10 @@ const WORKFLOW_SECTION = 'work-chain:workflow-mode'
 const RUNS_DIR_NAME = '.workchain'
 /** 审美顾问的建议落盘目录（每次调用一个 runId 子目录）。 */
 const AESTHETIC_DIR_NAME = '.aesthetic'
+/** 内置审美顾问虚拟成员名：不占团队槽位，任务由宿主直接拉起一次性审美子代理执行。 */
+const AESTHETIC_MEMBER_NAME = 'aesthetic'
+/** 审美顾问任务默认/最长等待预算（秒）。 */
+const AESTHETIC_TASK_TIMEOUT_SECONDS = 180
 
 /**
  * 「工作流模式」开启时注入系统提示的一段话：让当前会话默认走 work_flow 调度 + 验收循环，
@@ -174,6 +182,109 @@ function normalizeMembers(input) {
   return members
 }
 
+/** 判断成员名是否指向内置审美顾问虚拟成员（`aesthetic`）。 */
+function isAestheticMemberName(name) {
+  return typeof name === 'string' && name.trim() === AESTHETIC_MEMBER_NAME
+}
+
+/**
+ * 把启用中的审美顾问包装成一个可调用的虚拟成员；未启用时返回 undefined。
+ * 虚拟成员不占团队槽位、不 spawn teammate，派活时由宿主直接拉起一次性审美子代理。
+ * @param {object} config - 工作链配置。
+ * @returns {{name:string, provider:string, model:string, virtual:'aesthetic'}|undefined}
+ */
+function aestheticMember(config) {
+  const aesthetic = config?.aesthetic
+  if (aesthetic === null || typeof aesthetic !== 'object' || aesthetic.enabled !== true) return undefined
+  return {
+    name: AESTHETIC_MEMBER_NAME,
+    provider: String(aesthetic.provider ?? '').trim() || DEFAULT_PROVIDER,
+    model: String(aesthetic.model ?? '').trim() || DEFAULT_MODEL,
+    virtual: 'aesthetic',
+  }
+}
+
+/** 是否虚拟成员（目前只有审美顾问）：不占团队槽位，也不作为 teammate 派活。 */
+function isVirtualMember(member) {
+  return member !== null && typeof member === 'object' && member.virtual === 'aesthetic'
+}
+
+/** 把成员拆成「真实 Agent Teams 成员」与「虚拟成员（审美顾问）」。 */
+function splitVirtualMembers(members) {
+  const real = []
+  const virtual = []
+  for (const member of members) (isVirtualMember(member) ? virtual : real).push(member)
+  return { real, virtual }
+}
+
+/**
+ * 可调用的成员列表：配置里的真实成员 + 启用时的审美顾问虚拟成员（不占团队槽位）。
+ * 与 work_chain / work_flow 里「点名成员」使用的名字保持一致。
+ */
+function callableMembers(config) {
+  const list = Array.isArray(config?.members) ? [...config.members] : []
+  const advisor = aestheticMember(config)
+  if (advisor !== undefined && !list.some((member) => member.name === advisor.name)) list.push(advisor)
+  return list
+}
+
+/**
+ * 解析一次调用里的 `members` 覆盖：普通成员走 normalizeMembers；
+ * 名字为 `aesthetic` 的项视为「点名内置审美顾问」，provider/model 取插件页配置。
+ * @param {Array} input - 工具参数 members。
+ * @returns {{members:Array, wantsAesthetic:boolean}}
+ */
+function normalizeMemberOverride(input) {
+  if (!Array.isArray(input)) throw new Error('members 必须是数组')
+  const rest = []
+  let wantsAesthetic = false
+  for (const raw of input) {
+    if (raw !== null && typeof raw === 'object' && isAestheticMemberName(raw.name)) {
+      wantsAesthetic = true
+      continue
+    }
+    rest.push(raw)
+  }
+  return { members: rest.length === 0 ? [] : normalizeMembers(rest), wantsAesthetic }
+}
+
+/**
+ * 给成员分配分工：先按 `subtasks[].member` 点名，再按顺序把剩余分工补给还没分工的成员。
+ * 点名的成员不存在时该条分工不派发（记入 unknown），多出来的分工记入 extras。
+ * @param {Array} members - 本次实际参与的成员（按顺序）。
+ * @param {Array} subtasks - 工具参数 subtasks。
+ * @returns {{assignment:Map<number, object>, unknown:string[], extras:number}}
+ */
+function assignSubtasks(members, subtasks) {
+  const indexByName = new Map(members.map((member, index) => [member.name, index]))
+  const assignment = new Map()
+  const unknown = []
+  const pending = []
+  for (const spec of Array.isArray(subtasks) ? subtasks : []) {
+    if (spec === null || typeof spec !== 'object') continue
+    const target = typeof spec.member === 'string' ? spec.member.trim() : ''
+    if (target === '') {
+      pending.push(spec)
+      continue
+    }
+    const index = indexByName.get(target)
+    if (index === undefined) {
+      unknown.push(target)
+      continue
+    }
+    if (assignment.has(index)) {
+      pending.push(spec)
+      continue
+    }
+    assignment.set(index, spec)
+  }
+  for (let index = 0; index < members.length && pending.length > 0; index += 1) {
+    if (assignment.has(index)) continue
+    assignment.set(index, pending.shift())
+  }
+  return { assignment, unknown, extras: pending.length }
+}
+
 /** 审美顾问默认配置：默认开启、默认 flash、无额外审美偏好。 */
 function defaultAesthetic() {
   return { enabled: true, provider: DEFAULT_PROVIDER, model: DEFAULT_MODEL, styleNotes: '' }
@@ -203,8 +314,12 @@ function defaultConfig() {
 /** 校验整份配置（GUI POST 与工具共用）。成员数量上限 64；实际可用数在调用时按设置里的智能体上限裁。 */
 function normalizeConfig(input) {
   const source = input !== null && typeof input === 'object' ? input : {}
+  const members = normalizeMembers(source.members ?? DEFAULT_MEMBERS)
+  if (members.some((member) => member.name === AESTHETIC_MEMBER_NAME)) {
+    throw new Error('成员名 aesthetic 是内置审美顾问虚拟成员，普通成员请改用其它名字')
+  }
   return {
-    members: normalizeMembers(source.members ?? DEFAULT_MEMBERS),
+    members,
     workflowMode: source.workflowMode === true,
     maxParallel: clampInteger(source.maxParallel, 4, 1, 8),
     timeoutSeconds: clampInteger(source.timeoutSeconds, 600, 30, 3600),
@@ -585,9 +700,11 @@ function installConfigRoute(ctx) {
         const team = teamSnapshot(ctx)
         if (req.method === 'GET') {
           const catalog = await buildModelCatalog(ctx)
+          const config = readConfig()
           sendJson(res, 200, {
             ok: true,
-            config: readConfig(),
+            config,
+            callableMembers: callableMembers(config),
             defaults: {
               members: DEFAULT_MEMBERS.map((member) => ({ ...member })),
               models: GO_MODELS,
@@ -696,6 +813,9 @@ function formatToolOutput(value) {
     lines.push(
       `团队容量：设置上限 ${value.team.maxMembers}（来源 ${value.team.limitSource}）· 本次开始前已用 ${value.team.usedBefore} · 复用 ${value.team.reused} 个`,
     )
+    for (const virtual of value.team.virtualMembers ?? []) {
+      lines.push(`虚拟成员：${virtual.name}（${virtual.provider}/${virtual.model}）· ${virtual.reason}`)
+    }
   }
   for (const note of value.notes ?? []) lines.push(`注意：${note}`)
   for (const skipped of value.team?.skipped ?? []) lines.push(`跳过成员 ${skipped.name}（${skipped.model}）：${skipped.reason}`)
@@ -705,7 +825,8 @@ function formatToolOutput(value) {
       member.actualModel === undefined
         ? '（实际请求模型未读到）'
         : `（实际请求：${member.actualProvider}/${member.actualModel}）`
-    lines.push(`## ${member.name}（${member.provider}/${member.model}）${actual}`)
+    const virtualLabel = member.virtual === true ? ' · 虚拟成员·审美顾问，不占团队槽位' : ''
+    lines.push(`## ${member.name}（${member.provider}/${member.model}）${actual}${virtualLabel}`)
     lines.push(`任务板：${member.taskId} · 状态：${member.taskStatus}${member.fileFound ? ` · 结果文件：${member.file}` : ' · 结果文件缺失'}${member.error === undefined ? '' : ` · 派活错误：${member.error}`}`)
     lines.push('')
     if (member.summary !== undefined && member.summary.length > 0) {
@@ -719,7 +840,7 @@ function formatToolOutput(value) {
     }
     lines.push('')
   }
-  lines.push('请基于以上成员结果完成最终汇总/核验；完整文件在 `.workchain/<runId>/` 目录。')
+  lines.push('请基于以上成员结果完成最终汇总/核验；完整文件在 `.workchain/<runId>/` 目录（审美顾问建议在 `.aesthetic/<runId>/`）。')
   return lines.join('\n')
 }
 
@@ -804,6 +925,113 @@ function blocksToText(blocks) {
     .join('\n')
 }
 
+/**
+ * 把虚拟成员（审美顾问）的任务板任务写成摘要后 complete，避免留下 pending/in_progress。
+ * 任务板更新失败不影响建议本身。
+ */
+async function completeAdvisorTask(agentTeams, lead, taskId, title, resultFile, summary, error) {
+  const body = String(summary ?? '').trim()
+  const text = escapeTaskText(
+    `【审美顾问】${title}\n\n${body.length > 0 ? body : '（没有返回建议）'}${error === undefined ? '' : `\n\n调用异常：${error}`}\n\n完整建议：${resultFile}`,
+    TASK_DESCRIPTION_LIMIT,
+  )
+  try {
+    // 任务板只允许「in_progress」的任务 complete；审美顾问不是 teammate，
+    // 所以由 Lead 会话自己 claim 一下，再写摘要并完成。
+    let current = agentTeams.getTask(lead, taskId)
+    if (current.status === 'pending') {
+      current = await agentTeams.updateTask(lead, {
+        taskId,
+        expectedRevision: current.revision,
+        action: 'claim',
+      })
+    }
+    const edited = await agentTeams.updateTask(lead, {
+      taskId,
+      expectedRevision: current.revision,
+      action: 'edit',
+      description: text,
+    })
+    await agentTeams.updateTask(lead, { taskId, expectedRevision: edited.revision, action: 'complete' })
+  } catch {
+    /* 任务板结算失败不阻塞建议返回 */
+  }
+}
+
+/**
+ * 拉起一次性审美评审子代理并等待结果：leader 的 `aesthetic_advice` 工具与
+ * 虚拟成员 `aesthetic` 的派活共用这一段逻辑。
+ * @param {object} ctx - cordis 插件上下文。
+ * @param {{lead:object, provider:string, model:string, target:string, focus?:string, context?:string,
+ *   styleNotes?:string, resultFile:string, runId:string, timeoutSeconds:number, signal?:AbortSignal}} options
+ * @returns {Promise<{advice:string, provider:string, model:string, actualProvider?:string, actualModel?:string,
+ *   childId?:string, elapsedMs:number, timedOut:boolean, error?:string}>}
+ */
+async function reviewWithAesthetic(ctx, options) {
+  const { lead, provider, model, target, focus, context, styleNotes, resultFile, runId, timeoutSeconds, signal } = options
+  const subagents = ctx.get('subagents')
+  if (subagents === undefined || subagents === null) throw new Error('审美顾问需要 subagents 服务：请在插件页启用它')
+  const prompt = buildAestheticPrompt({ target, focus, context, styleNotes, resultFile, runId, timeoutSeconds })
+  const outerSignal = signal ?? new AbortController().signal
+  const startedAt = Date.now()
+  let activation
+  try {
+    activation = await subagents.startActivation({
+      provider: 'spawn',
+      label: 'aesthetic advisor',
+      delivery: 'parent',
+      signal: AbortSignal.any([outerSignal, AbortSignal.timeout(timeoutSeconds * 1000)]),
+      request: {
+        prompt: [{ type: 'text', text: prompt }],
+        parent: lead,
+        agentOptions: { provider, model },
+      },
+    })
+  } catch (error) {
+    throw new Error(`审美顾问调用失败：${errorMessage(error)}`)
+  }
+  let result
+  let failure
+  let budgetTimer
+  try {
+    // 硬超时：除了把 AbortSignal 传给 startActivation，还在这里用 Promise.race 兜住，
+    // 到点立即释放子代理并返回已落盘的部分建议。
+    result = await Promise.race([
+      activation.result,
+      new Promise((_resolve, reject) => {
+        budgetTimer = setTimeout(() => {
+          reject(new Error(`审美顾问超时（${timeoutSeconds}s，已中断）`))
+        }, timeoutSeconds * 1000)
+      }),
+    ])
+  } catch (error) {
+    failure = errorMessage(error)
+  } finally {
+    if (budgetTimer !== undefined) clearTimeout(budgetTimer)
+  }
+  const applied = readAppliedRoute(ctx, activation.childId)
+  try {
+    await activation.dispose()
+  } catch {
+    /* 释放失败不影响建议 */
+  }
+  const fileText = readResultFile(resultFile)
+  const advice = (fileText ?? blocksToText(result?.output)).trim()
+  if (advice.length === 0 && failure !== undefined) throw new Error(`审美顾问调用失败：${failure}`)
+  return {
+    advice,
+    provider,
+    model,
+    actualProvider: applied?.provider,
+    actualModel: applied?.model,
+    childId: activation.childId,
+    elapsedMs: Date.now() - startedAt,
+    timedOut: /超时|timed? out|abort/iu.test(failure ?? ''),
+    ...(failure === undefined ? {} : { error: failure }),
+  }
+}
+
+
 /** 工作流（work_flow）持久状态：按 Lead 会话保存 runId、key→taskId 映射、任务尝试次数。 */
 function flowFile() {
   return path.join(homeDir(), 'work-chain', 'flows.json')
@@ -880,6 +1108,51 @@ function buildFlowWorkerPrompt(options) {
   ].join('\n')
 }
 
+/**
+ * work_flow 里的虚拟成员（审美顾问）任务：异步跑一次审美评审，写结果文件并结算任务板。
+ * 不 spawn teammate，不占团队槽位；完成后由后续 work_flow 调用按任务板收集。
+ */
+async function runFlowAdvisorTask(ctx, agentTeams, lead, options) {
+  const { config, task, spec, taskId, title, prompt, resultFile, runDir, runId, state, save, timeoutSeconds } = options
+  const meta = state.tasks[taskId]
+  try {
+    const outcome = await reviewWithAesthetic(ctx, {
+      lead,
+      provider: spec.provider,
+      model: spec.model,
+      target: prompt,
+      context: `工作流总目标：${task}`,
+      styleNotes: config.aesthetic.styleNotes,
+      resultFile,
+      runId,
+      timeoutSeconds,
+    })
+    try {
+      fs.mkdirSync(runDir, { recursive: true })
+      fs.writeFileSync(
+        resultFile,
+        outcome.advice.length > 0 ? outcome.advice : `（审美顾问没有返回建议${outcome.error === undefined ? '' : `：${outcome.error}`}）`,
+        'utf8',
+      )
+    } catch {
+      /* 结果文件写不进就只靠任务板摘要 */
+    }
+    await completeAdvisorTask(agentTeams, lead, taskId, title, resultFile, outcome.advice, outcome.error)
+    if (meta !== undefined) meta.error = outcome.error
+  } catch (error) {
+    const message = errorMessage(error)
+    await completeAdvisorTask(agentTeams, lead, taskId, title, resultFile, '', message)
+    if (meta !== undefined) meta.error = message
+  } finally {
+    if (meta !== undefined) {
+      meta.running = false
+      meta.assignedAt = Date.now()
+      meta.reported = false
+    }
+    save()
+  }
+}
+
 /** 保证工作流的 worker 池存在：同名 teammate 复用（并重新锁定模型），缺的空槽新建。 */
 async function ensureFlowPool(ctx, agentTeams, lead, members, notes, signal) {
   const policy = readTeamPolicy(ctx)
@@ -888,7 +1161,7 @@ async function ensureFlowPool(ctx, agentTeams, lead, members, notes, signal) {
   const reusable = new Map(teammates.filter((row) => row.status !== 'failed').map((row) => [row.name, row]))
   let slotsLeft = Math.max(0, policy.maxMembers - teammates.length)
   const pool = []
-  for (const member of members) {
+  for (const member of members.filter((candidate) => !isVirtualMember(candidate))) {
     const existing = reusable.get(member.name)
     if (existing !== undefined) {
       const live = ctx.get('agents')?.get?.(existing.id)
@@ -949,8 +1222,8 @@ async function wakeFlowWorker(ctx, agentTeams, lead, spec, prompt, signal) {
   })
 }
 
-/** 读一条已完成的流程任务（任务板摘要 + 结果文件）。 */
-function collectFlowTask(agentTeams, lead, taskId, runDir) {
+/** 读一条已完成的流程任务（任务板摘要 + 结果文件）；虚拟成员没有任务板 owner，可由调用方补上。 */
+function collectFlowTask(agentTeams, lead, taskId, runDir, ownerOverride) {
   let view
   try {
     view = agentTeams.getTask(lead, taskId)
@@ -964,7 +1237,8 @@ function collectFlowTask(agentTeams, lead, taskId, runDir) {
     taskId,
     title: view.subject,
     status: view.status,
-    owner: view.ownerName,
+    // 虚拟成员（审美顾问）由 Lead claim 后完成，ownerName 会变成 lead；优先用调度时记录的 worker。
+    owner: ownerOverride ?? view.ownerName,
     summary: escapeTaskText(summary, 4000),
     file,
     fileFound: fileText !== undefined,
@@ -978,7 +1252,13 @@ function formatFlowOutput(value) {
     `# work_flow ${value.done ? '（队列清空）' : '（调度返回，等待 Lead 验收/补充任务）'}`,
     `flow: ${value.flowRun} | 总任务数 ${value.counts.total} | 待办 ${value.counts.pending} · 进行中 ${value.counts.inProgress} · 已完成 ${value.counts.completed}`,
   ]
-  if (value.workers.length > 0) lines.push(`worker：${value.workers.map((w) => `${w.name}(${w.model}/${w.status})`).join('、')}`)
+  if (value.workers.length > 0) {
+    lines.push(
+      `worker：${value.workers
+        .map((w) => `${w.name}(${w.model}/${w.status}${w.virtual === true ? '，虚拟·不占槽位' : ''})`)
+        .join('、')}`,
+    )
+  }
   for (const note of value.notes ?? []) lines.push(`注意：${note}`)
   lines.push('')
   if (value.assigned.length > 0) {
@@ -1031,7 +1311,7 @@ function apply(ctx) {
   const disposeTool = ctx.tools.register({
     name: 'work_chain',
     description:
-      'Run one fan-out work chain with the built-in Agent Teams. The current session stays the leader and supplies the task; each configured member becomes a durable Agent Teams teammate with its own model and writes the full result under .workchain/<runId>/. Members are visible on the team UI and task board, are reused by name across calls, and are limited by the "max agents" setting; members that cannot get a slot are skipped and reported. Use it when a task benefits from several independent model perspectives or parallel work. Only the Team Lead may call it. Configure members (name/provider/model) on the Work Chain bundle page.',
+      'Run one fan-out work chain with the built-in Agent Teams. The current session stays the leader and supplies the task; each configured member becomes a durable Agent Teams teammate with its own model and writes the full result under .workchain/<runId>/. Members are visible on the team UI and task board, are reused by name across calls, and are limited by the "max agents" setting; members that cannot get a slot are skipped and reported. If the aesthetic advisor is enabled on the plugin page, it is also callable as a virtual member named "aesthetic" (one-off disposable reviewer, does not take a team slot): name it in subtasks[].member to have it review a deliverable. Use it when a task benefits from several independent model perspectives or parallel work. Only the Team Lead may call it. Configure members (name/provider/model) on the Work Chain bundle page.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1052,7 +1332,11 @@ function apply(ctx) {
             properties: {
               title: { type: 'string', description: 'Short task-board subject.' },
               prompt: { type: 'string', description: 'Self-contained instruction for this member.' },
-              member: { type: 'string', description: 'Optional configured member name to assign this subtask to.' },
+              member: {
+                type: 'string',
+                description:
+                  'Optional configured member name to assign this subtask to; use "aesthetic" for the built-in aesthetic advisor virtual member (enabled on the plugin page).',
+              },
             },
           },
         },
@@ -1116,19 +1400,35 @@ function apply(ctx) {
       const roster = agentTeams.listMembers(lead)
       const teammatesBefore = roster.filter((row) => row.role !== 'lead')
       const reusableByName = new Map(teammatesBefore.filter((row) => row.status !== 'failed').map((row) => [row.name, row]))
-      const requestedMembers = args.members === undefined ? config.members : normalizeMembers(args.members)
       const notes = []
-      let plans
-      let planItems = []
-      let skipped = []
-      let members = requestedMembers
-      if (members.length > policy.maxMembers) {
-        notes.push(`配置了 ${members.length} 个成员，超过智能体上限 ${policy.maxMembers}，本次只用前 ${policy.maxMembers} 个`)
-        members = members.slice(0, policy.maxMembers)
+      const advisor = aestheticMember(config)
+      const override = args.members === undefined ? undefined : normalizeMemberOverride(args.members)
+      const wantsAdvisor =
+        override?.wantsAesthetic === true ||
+        subtasks.some((spec) => spec !== null && typeof spec === 'object' && isAestheticMemberName(spec.member))
+      if (wantsAdvisor && advisor === undefined) {
+        throw new Error('审美顾问未启用：请在「插件 → 工作链 → 审美顾问」开启后再把成员/分工写成 aesthetic')
       }
+      // 虚拟成员（审美顾问）不占团队槽位：先按真实成员的容量裁剪，再把虚拟成员追加在最后。
+      const split = splitVirtualMembers(override === undefined ? config.members : override.members)
+      let realMembers = split.real
+      const virtualMembers = [...split.virtual]
+      if (wantsAdvisor && advisor !== undefined) virtualMembers.push(advisor)
+      if (realMembers.length > policy.maxMembers) {
+        notes.push(`配置了 ${realMembers.length} 个成员，超过智能体上限 ${policy.maxMembers}，本次只用前 ${policy.maxMembers} 个`)
+        realMembers = realMembers.slice(0, policy.maxMembers)
+      }
+      const members = [...realMembers, ...virtualMembers]
+      let planItems = []
+      const skipped = []
       let slotsLeft = Math.max(0, policy.maxMembers - teammatesBefore.length)
       const usedReuseNames = new Set()
       for (const [index, member] of members.entries()) {
+        if (isVirtualMember(member)) {
+          // 审美顾问：宿主自己拉起一次性子代理，不 spawn、不占槽位。
+          planItems.push({ member, index, reuse: undefined })
+          continue
+        }
         const existing = reusableByName.get(member.name)
         if (existing !== undefined && !usedReuseNames.has(existing.name)) {
           usedReuseNames.add(existing.name)
@@ -1152,12 +1452,21 @@ function apply(ctx) {
         )
       }
       if (skipped.length > 0) notes.push(`${skipped.length} 个成员因槽位不足被跳过：${skipped.map((row) => row.name).join(', ')}`)
-      plans = planItems.map((item) => {
-        const requested = subtasks[item.index]
+      if (wantsAdvisor) notes.push('审美顾问（aesthetic）是虚拟成员：不占团队槽位，由宿主直接拉起一次性子代理执行')
+      const includedMembers = planItems.map((item) => item.member)
+      const assignment = assignSubtasks(includedMembers, subtasks)
+      const unknownTargets = [...new Set(assignment.unknown)]
+      if (unknownTargets.length > 0) notes.push(`subtasks 指定的成员不存在：${unknownTargets.join(', ')}（对应分工未派发）`)
+      if (assignment.extras > 0) notes.push(`有 ${assignment.extras} 条分工没有对应成员（成员数不足或重复点名），已忽略`)
+      const plans = planItems.map((item, position) => {
+        const requested = assignment.assignment.get(position)
+        const virtual = isVirtualMember(item.member)
         const role =
           requested !== undefined && typeof requested.prompt === 'string' && requested.prompt.length > 0
             ? requested.prompt
-            : `独立完成总任务中你负责的部分（编号 ${item.index + 1}）。如果与其他成员并行，请选择不重复的角度，给出可核查的结论与来源。`
+            : virtual
+              ? `对「${task}」做一次独立审美评审：给出总评分数与按影响排序的具体修改建议（只给建议、不改文件）。`
+              : `独立完成总任务中你负责的部分（编号 ${item.index + 1}）。如果与其他成员并行，请选择不重复的角度，给出可核查的结论与来源。`
         const title =
           requested !== undefined && typeof requested.title === 'string' && requested.title.trim().length > 0
             ? requested.title.trim()
@@ -1168,19 +1477,21 @@ function apply(ctx) {
       // 建团队任务
       const created = []
       for (const [index, plan] of plans.entries()) {
-        const resultFile = path.join(runDir, `${plan.member.name}.md`)
-        const prompt = buildMemberPrompt({
-          task,
-          subtask: plan.role,
-          member: plan.member,
-          runId,
-          taskId: 'PENDING',
-          taskRevision: 1,
-          timeoutSeconds,
-          resultFile,
-        })
+        const virtual = isVirtualMember(plan.member)
+        const resultFile = virtual
+          ? path.join(cwd, AESTHETIC_DIR_NAME, runId, 'advice.md')
+          : path.join(runDir, `${plan.member.name}.md`)
+        if (virtual) {
+          try {
+            fs.mkdirSync(path.dirname(resultFile), { recursive: true })
+          } catch {
+            /* 目录建不出来就让审美顾问自己建 */
+          }
+        }
         const description = escapeTaskText(
-          `【工作链】成员 ${plan.member.name}（${plan.member.provider}/${plan.member.model}）\n\n分工：${plan.role}\n\n完成后把摘要写进本任务 description 并 complete；完整结果写到 ${resultFile}`,
+          virtual
+            ? `【工作链】成员 ${plan.member.name}（审美顾问，${plan.member.provider}/${plan.member.model}；虚拟成员，不占团队槽位）\n\n分工：${plan.role}\n\n宿主会调用审美顾问，把建议摘要写回本任务并 complete；完整建议写到 ${resultFile}`
+            : `【工作链】成员 ${plan.member.name}（${plan.member.provider}/${plan.member.model}）\n\n分工：${plan.role}\n\n完成后把摘要写进本任务 description 并 complete；完整结果写到 ${resultFile}`,
           TASK_DESCRIPTION_LIMIT,
         )
         const view = await agentTeams.createTask(lead, {
@@ -1188,17 +1499,19 @@ function apply(ctx) {
           description,
           writeScopes: [],
         })
-        const withTask = buildMemberPrompt({
-          task,
-          subtask: plan.role,
-          member: plan.member,
-          runId,
-          taskId: view.id,
-          taskRevision: view.revision,
-          timeoutSeconds,
-          resultFile,
-        })
-        created.push({ ...plan, taskId: view.id, taskRevision: view.revision, baseDescription: description, resultFile, prompt: withTask, index })
+        const prompt = virtual
+          ? ''
+          : buildMemberPrompt({
+              task,
+              subtask: plan.role,
+              member: plan.member,
+              runId,
+              taskId: view.id,
+              taskRevision: view.revision,
+              timeoutSeconds,
+              resultFile,
+            })
+        created.push({ ...plan, taskId: view.id, taskRevision: view.revision, baseDescription: description, resultFile, prompt, index })
       }
 
       // 派活：可复用同名同模型的成员（发消息），否则以该成员模型 spawn 新 teammate
@@ -1209,8 +1522,38 @@ function apply(ctx) {
       } catch {
         /* 写不进也没关系，任务板仍是交付面 */
       }
+      const advisorRuns = []
+      const advisorResults = new Map()
       for (const item of created) {
         throwIfAborted(signal)
+        if (isVirtualMember(item.member)) {
+          // 虚拟成员：不 spawn teammate，由宿主直接拉起一次性审美子代理并结算任务板。
+          const promise = (async () => {
+            try {
+              const outcome = await reviewWithAesthetic(ctx, {
+                lead,
+                provider: item.member.provider,
+                model: item.member.model,
+                target: item.role,
+                context: `工作链总任务：${task}`,
+                styleNotes: config.aesthetic.styleNotes,
+                resultFile: item.resultFile,
+                runId,
+                timeoutSeconds: Math.min(600, timeoutSeconds),
+                signal,
+              })
+              await completeAdvisorTask(agentTeams, lead, item.taskId, item.title, item.resultFile, outcome.advice, outcome.error)
+              advisorResults.set(item.taskId, outcome)
+            } catch (error) {
+              const message = errorMessage(error)
+              await completeAdvisorTask(agentTeams, lead, item.taskId, item.title, item.resultFile, '', message)
+              advisorResults.set(item.taskId, { advice: '', elapsedMs: 0, timedOut: false, error: message })
+            }
+          })()
+          advisorRuns.push(promise)
+          dispatched.push({ ...item, memberId: undefined, reused: false, virtual: true })
+          continue
+        }
         const existing = item.reuse
         try {
           if (existing !== undefined) {
@@ -1305,7 +1648,7 @@ function apply(ctx) {
       // 等任务板完成（没有任何成员成功派活时直接返回，不必空等到超时）
       const activeDispatched = dispatched.filter((item) => item.error === undefined)
       const activeTaskIds = new Set(activeDispatched.map((item) => item.taskId))
-      const allCompleted =
+      let allCompleted =
         activeTaskIds.size === 0
           ? false
           : await waitForTasks({
@@ -1315,6 +1658,15 @@ function apply(ctx) {
               timeoutMs,
               signal: exec.signal,
             })
+      // 审美顾问的 promise 有自身预算（≤ 链超时），这里等它落定以拿到实际路由/建议；
+      // 它超时后仍会把已落盘的建议写回任务板并 complete，所以再核对一次任务板状态。
+      if (advisorRuns.length > 0) {
+        await Promise.allSettled(advisorRuns)
+        if (activeTaskIds.size > 0) {
+          const settledBoard = new Map(agentTeams.listTasks(lead).map((task) => [task.id, task]))
+          allCompleted = [...activeTaskIds].every((taskId) => settledBoard.get(taskId)?.status === 'completed')
+        }
+      }
 
       // 取消未完成的成员（只在整体超时时），然后收集结果
       const latestTasks = new Map(agentTeams.listTasks(lead).map((task) => [task.id, task]))
@@ -1334,7 +1686,11 @@ function apply(ctx) {
                 ? `${output.slice(0, 3000)}\n…（摘要取自结果文件）`
                 : output
               : boardDescription
-        const applied = readAppliedRoute(ctx, item.memberId)
+        const virtual = isVirtualMember(item.member)
+        const advisorOutcome = virtual ? advisorResults.get(item.taskId) : undefined
+        const applied = virtual
+          ? { provider: advisorOutcome?.actualProvider, model: advisorOutcome?.actualModel }
+          : readAppliedRoute(ctx, item.memberId)
         const entry = {
           name: item.member.name,
           spawnName: item.spawnName ?? item.member.name,
@@ -1342,7 +1698,8 @@ function apply(ctx) {
           model: item.member.model,
           actualProvider: applied?.provider,
           actualModel: applied?.model,
-          modelLocked: item.modelLocked === true,
+          modelLocked: virtual ? false : item.modelLocked === true,
+          ...(virtual ? { virtual: true } : {}),
           taskId: item.taskId,
           taskStatus: task?.status ?? 'missing',
           summary,
@@ -1350,7 +1707,11 @@ function apply(ctx) {
           file: item.resultFile,
           fileFound: output !== undefined,
           ...(output === undefined ? {} : { output }),
-          ...(item.error === undefined ? {} : { error: item.error }),
+          ...(item.error !== undefined
+            ? { error: item.error }
+            : advisorOutcome?.error !== undefined
+              ? { error: advisorOutcome.error }
+              : {}),
           ...(item.reused === true ? { reused: true } : {}),
         }
         membersOut.push(entry)
@@ -1359,7 +1720,8 @@ function apply(ctx) {
           // 输出预算用完：后续只保留摘要，避免把模型上下文打爆
           for (const later of dispatched.slice(dispatched.indexOf(item) + 1)) {
             const laterTask = latestTasks.get(later.taskId)
-            const laterApplied = readAppliedRoute(ctx, later.memberId)
+            const laterVirtual = isVirtualMember(later.member)
+            const laterApplied = laterVirtual ? undefined : readAppliedRoute(ctx, later.memberId)
             membersOut.push({
               name: later.member.name,
               spawnName: later.spawnName ?? later.member.name,
@@ -1367,7 +1729,8 @@ function apply(ctx) {
               model: later.member.model,
               actualProvider: laterApplied?.provider,
               actualModel: laterApplied?.model,
-              modelLocked: later.modelLocked === true,
+              modelLocked: laterVirtual ? false : later.modelLocked === true,
+              ...(laterVirtual ? { virtual: true } : {}),
               taskId: later.taskId,
               taskStatus: laterTask?.status ?? 'missing',
               summary: laterTask?.description,
@@ -1380,9 +1743,9 @@ function apply(ctx) {
       }
 
       if (!allCompleted) {
-        // 超时：打断仍在跑的成员，避免后台空转
+        // 超时：打断仍在跑的成员，避免后台空转（虚拟成员由宿主自己收尾，不打断）。
         for (const member of membersOut) {
-          if (member.taskStatus !== 'completed') {
+          if (member.taskStatus !== 'completed' && member.virtual !== true) {
             try {
               agentTeams.interrupt(lead, member.spawnName)
             } catch {
@@ -1411,6 +1774,12 @@ function apply(ctx) {
           usedBefore: teammatesBefore.length,
           reused: membersOut.filter((member) => member.reused === true).length,
           skipped,
+          virtualMembers: virtualMembers.map((member) => ({
+            name: member.name,
+            provider: member.provider,
+            model: member.model,
+            reason: '审美顾问虚拟成员：不占团队智能体槽位',
+          })),
         },
         notes,
       })
@@ -1420,7 +1789,7 @@ function apply(ctx) {
   const disposeFlowTool = ctx.tools.register({
     name: 'work_flow',
     description:
-      'Run an iterative work-flow with the built-in Agent Teams. The current session is the Lead and final reviewer; a pool of durable teammate workers (each with its own configured model) is reused for the whole flow. Each call: create the given task list on the team task board, assign ready pending tasks to idle workers (Lead reassigns the task and messages the worker), wait until at least one task finishes (or nothing can progress), then return the finished results for your review. Add follow-up tasks in the next call (with depends_on keys for ordering); keep calling until done=true and then give the final acceptance. Only the Team Lead may call it. Configure the worker pool (name/provider/model) on the Work Chain bundle page or pass members here.',
+      'Run an iterative work-flow with the built-in Agent Teams. The current session is the Lead and final reviewer; a pool of durable teammate workers (each with its own configured model) is reused for the whole flow. Each call: create the given task list on the team task board, assign ready pending tasks to idle workers (Lead reassigns the task and messages the worker), wait until at least one task finishes (or nothing can progress), then return the finished results for your review. Add follow-up tasks in the next call (with depends_on keys for ordering); keep calling until done=true and then give the final acceptance. If the aesthetic advisor is enabled on the plugin page, it is also available as a virtual worker named "aesthetic" (one-off reviewer, does not take a team slot): set tasks[].member to "aesthetic" to route a task to it. Only the Team Lead may call it. Configure the worker pool (name/provider/model) on the Work Chain bundle page or pass members here.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -1439,6 +1808,11 @@ function apply(ctx) {
               key: { type: 'string', description: 'Optional stable key, used by depends_on and to dedupe tasks across calls.' },
               title: { type: 'string', description: 'Short task-board subject.' },
               prompt: { type: 'string', description: 'Self-contained instruction for the worker.' },
+              member: {
+                type: 'string',
+                description:
+                  'Optional worker name to pin this task to; use "aesthetic" for the built-in aesthetic advisor virtual worker (does not take a team slot). Omit to let any idle worker take it.',
+              },
               depends_on: {
                 type: 'array',
                 items: { type: 'string' },
@@ -1484,10 +1858,24 @@ function apply(ctx) {
       const task = typeof args.task === 'string' ? args.task.trim() : ''
       if (task.length === 0) throw new Error('task 不能为空')
       const config = readConfig()
-      const members = args.members === undefined ? config.members : normalizeMembers(args.members)
+      const notes = []
+      // 虚拟成员（审美顾问）：按需加入 worker 池，不占团队槽位。
+      const advisor = aestheticMember(config)
+      const override = args.members === undefined ? undefined : normalizeMemberOverride(args.members)
+      const wantsAdvisor =
+        override?.wantsAesthetic === true ||
+        (Array.isArray(args.tasks) &&
+          args.tasks.some((spec) => spec !== null && typeof spec === 'object' && isAestheticMemberName(spec.member)))
+      if (wantsAdvisor && advisor === undefined) {
+        notes.push('审美顾问未启用：member=aesthetic 的任务按普通 worker 派发（可在插件页「工作链 → 审美顾问」开启）')
+      }
+      const baseMembers = override === undefined ? config.members : override.members
+      const splitMembers = splitVirtualMembers(baseMembers)
+      const advisorSpec = advisor !== undefined && (wantsAdvisor || splitMembers.virtual.length > 0) ? advisor : undefined
+      const members = [...splitMembers.real]
+      if (advisorSpec !== undefined) members.push(advisorSpec)
       const waitSeconds = clampInteger(args.wait_seconds, 90, 10, 600)
       const maxAssign = clampInteger(args.max_assign, Math.min(config.maxParallel, 8), 1, 12)
-      const notes = []
       const cwd = resolveWorkingDirectory(ctx, lead)
       const { state, save } = flowStateFor(lead)
       const runDir = path.join(cwd, '.workflow', state.runId)
@@ -1497,10 +1885,16 @@ function apply(ctx) {
         /* 目录建不了就靠任务板摘要 */
       }
 
-      // 1) 保证 worker 池（同名复用，缺的空槽新建）
-      const pool = await ensureFlowPool(ctx, agentTeams, lead, members, notes, signal)
+      // 1) 保证 worker 池（同名复用，缺的空槽新建；虚拟成员只登记、不 spawn）
+      const pool = await ensureFlowPool(ctx, agentTeams, lead, members.filter((member) => !isVirtualMember(member)), notes, signal)
+      if (advisorSpec !== undefined) pool.push(advisorSpec)
       if (pool.length === 0) throw new Error(`worker 池为空：${notes.join('；') || '没有可用成员'}`)
-      state.pool = pool.map((member) => ({ name: member.name, provider: member.provider, model: member.model }))
+      state.pool = pool.map((member) => ({
+        name: member.name,
+        provider: member.provider,
+        model: member.model,
+        ...(isVirtualMember(member) ? { virtual: 'aesthetic' } : {}),
+      }))
       save()
 
       // 2) 入队本轮新任务
@@ -1514,6 +1908,12 @@ function apply(ctx) {
           continue
         }
         const title = (typeof spec.title === 'string' && spec.title.trim().length > 0 ? spec.title.trim() : prompt).slice(0, 190)
+        const requested = typeof spec.member === 'string' ? spec.member.trim() : ''
+        let pinned = requested
+        if (requested !== '' && !pool.some((member) => member.name === requested)) {
+          notes.push(`任务「${title}」指定的成员 ${requested} 不在 worker 池，按普通派发`)
+          pinned = ''
+        }
         const blockedBy = (Array.isArray(spec.depends_on) ? spec.depends_on : [])
           .map((dependency) => state.keys[String(dependency)])
           .filter((id) => id !== undefined)
@@ -1524,7 +1924,17 @@ function apply(ctx) {
             blockedBy,
             writeScopes: [],
           })
-          state.tasks[view.id] = { key, title, attempts: 0, assignedAt: 0, worker: '', reported: false, createdAt: Date.now() }
+          state.tasks[view.id] = {
+            key,
+            title,
+            attempts: 0,
+            assignedAt: 0,
+            worker: '',
+            reported: false,
+            createdAt: Date.now(),
+            member: pinned,
+            running: false,
+          }
           if (key !== undefined) state.keys[key] = view.id
         } catch (error) {
           notes.push(`创建任务「${title}」失败：${errorMessage(error)}`)
@@ -1572,49 +1982,103 @@ function apply(ctx) {
 
       // 4) 把 ready 的待办派给空闲 worker（等待期间 worker 一空闲就继续派）
       const assigned = []
+      const advisorRuns = []
+      const dispatchToWorker = async (view, worker) => {
+        const meta = state.tasks[view.id]
+        const spec = state.pool.find((member) => member.name === worker.name) ?? { name: worker.name, model: '?' }
+        await agentTeams.updateTask(lead, { taskId: view.id, expectedRevision: view.revision, action: 'reassign', owner: worker.name })
+        meta.worker = worker.name
+        meta.attempts = (meta.attempts ?? 0) + 1
+        meta.assignedAt = Date.now()
+        await wakeFlowWorker(
+          ctx,
+          agentTeams,
+          lead,
+          spec,
+          buildFlowWorkerPrompt({
+            task,
+            prompt: view.description,
+            worker: spec,
+            taskId: view.id,
+            title: view.subject,
+            resultFile: path.join(runDir, `${view.id}.md`),
+            runId: state.runId,
+          }),
+          signal,
+        )
+        assigned.push({ taskId: view.id, title: view.subject, worker: worker.name })
+      }
       const assignReadyTasks = async () => {
         const roster = agentTeams.listMembers(lead)
+        const realPool = state.pool.filter((member) => !isVirtualMember(member))
         const idle = roster.filter(
-          (row) => row.role !== 'lead' && row.status === 'inactive' && state.pool.some((member) => member.name === row.name),
+          (row) => row.role !== 'lead' && row.status === 'inactive' && realPool.some((member) => member.name === row.name),
         )
-        if (idle.length === 0) return
         const latest = agentTeams.listTasks(lead)
         const ready = latest.filter(
           (row) =>
             state.tasks[row.id] !== undefined &&
+            state.tasks[row.id].running !== true &&
             row.status === 'pending' &&
             row.ownerName === undefined &&
             row.ready === true,
         )
-        const pairs = Math.min(maxAssign - assigned.length, idle.length, ready.length)
-        for (let index = 0; index < pairs; index += 1) {
-          throwIfAborted(signal)
-          const worker = idle[index]
-          const view = ready[index]
-          const meta = state.tasks[view.id]
-          const spec = state.pool.find((member) => member.name === worker.name) ?? { name: worker.name, model: '?' }
-          try {
-            await agentTeams.updateTask(lead, { taskId: view.id, expectedRevision: view.revision, action: 'reassign', owner: worker.name })
-            meta.worker = worker.name
+        const budgetLeft = () => maxAssign - assigned.length
+        // 4.1 点名给审美顾问（虚拟成员）的任务：宿主自己跑，同时只跑一个
+        const advisorSpec = state.pool.find((member) => isVirtualMember(member))
+        const advisorBusy = Object.values(state.tasks).some((meta) => meta.running === true)
+        if (advisorSpec !== undefined && advisorBusy !== true && budgetLeft() > 0) {
+          const view = ready.find((row) => state.tasks[row.id].member === AESTHETIC_MEMBER_NAME)
+          if (view !== undefined) {
+            const meta = state.tasks[view.id]
+            meta.running = true
+            meta.worker = advisorSpec.name
             meta.attempts = (meta.attempts ?? 0) + 1
             meta.assignedAt = Date.now()
-            await wakeFlowWorker(
-              ctx,
-              agentTeams,
-              lead,
-              spec,
-              buildFlowWorkerPrompt({
+            assigned.push({ taskId: view.id, title: view.subject, worker: advisorSpec.name })
+            advisorRuns.push(
+              runFlowAdvisorTask(ctx, agentTeams, lead, {
+                config,
                 task,
-                prompt: view.description,
-                worker: spec,
+                spec: advisorSpec,
                 taskId: view.id,
                 title: view.subject,
+                prompt: view.description,
                 resultFile: path.join(runDir, `${view.id}.md`),
+                runDir,
                 runId: state.runId,
+                state,
+                save,
+                timeoutSeconds: AESTHETIC_TASK_TIMEOUT_SECONDS,
               }),
-              signal,
             )
-            assigned.push({ taskId: view.id, title: view.subject, worker: worker.name })
+            ready.splice(ready.indexOf(view), 1)
+          }
+        }
+        // 4.2 点名给具体真实 worker 的任务：只派给该 worker
+        for (const view of [...ready]) {
+          if (budgetLeft() <= 0) break
+          throwIfAborted(signal)
+          const requested = state.tasks[view.id].member
+          if (requested === undefined || requested === '' || requested === AESTHETIC_MEMBER_NAME) continue
+          const worker = idle.find((row) => row.name === requested)
+          if (worker === undefined) continue
+          try {
+            await dispatchToWorker(view, worker)
+            idle.splice(idle.indexOf(worker), 1)
+            ready.splice(ready.indexOf(view), 1)
+          } catch (error) {
+            notes.push(`派发 ${view.id} 给 ${worker.name} 失败：${errorMessage(error)}`)
+          }
+        }
+        // 4.3 其余 ready 任务：任意空闲 worker 先到先得
+        for (const view of [...ready]) {
+          if (budgetLeft() <= 0) break
+          throwIfAborted(signal)
+          const worker = idle.shift()
+          if (worker === undefined) break
+          try {
+            await dispatchToWorker(view, worker)
           } catch (error) {
             notes.push(`派发 ${view.id} 给 ${worker.name} 失败：${errorMessage(error)}`)
           }
@@ -1635,7 +2099,7 @@ function apply(ctx) {
           if (view === undefined || view.status !== 'completed') continue
           if (state.tasks[taskId].reported === true) continue
           state.tasks[taskId].reported = true
-          completedNow.push(collectFlowTask(agentTeams, lead, taskId, runDir))
+          completedNow.push(collectFlowTask(agentTeams, lead, taskId, runDir, state.tasks[taskId].worker))
         }
         save()
         if (completedNow.length > 0) break
@@ -1644,19 +2108,26 @@ function apply(ctx) {
         save()
         const inProgress = current.some((row) => state.tasks[row.id] !== undefined && row.status === 'in_progress')
         const readyPending = current.some(
-          (row) => state.tasks[row.id] !== undefined && row.status === 'pending' && row.ownerName === undefined && row.ready === true,
+          (row) =>
+            state.tasks[row.id] !== undefined &&
+            state.tasks[row.id].running !== true &&
+            row.status === 'pending' &&
+            row.ownerName === undefined &&
+            row.ready === true,
         )
+        const advisorBusy = Object.values(state.tasks).some((meta) => meta.running === true)
         const roster = agentTeams.listMembers(lead)
+        const realPool = state.pool.filter((member) => !isVirtualMember(member))
         const idleCount = roster.filter(
-          (row) => row.role !== 'lead' && row.status === 'inactive' && state.pool.some((member) => member.name === row.name),
+          (row) => row.role !== 'lead' && row.status === 'inactive' && realPool.some((member) => member.name === row.name),
         ).length
         const workersBusy = roster.some(
           (row) =>
             row.role !== 'lead' &&
-            state.pool.some((member) => member.name === row.name) &&
+            realPool.some((member) => member.name === row.name) &&
             (row.status === 'running' || row.status === 'provisioning'),
         )
-        if (inProgress !== true && workersBusy !== true) {
+        if (inProgress !== true && workersBusy !== true && advisorBusy !== true) {
           if (readyPending !== true) break
           if (idleCount === 0) {
             notes.push('还有 ready 的待办任务，但没有空闲 worker（可能 worker 异常），先返回快照')
@@ -1672,7 +2143,16 @@ function apply(ctx) {
       const inProgress = flowTasks.filter((row) => row.status === 'in_progress')
       const completed = flowTasks.filter((row) => row.status === 'completed')
       const finalRoster = agentTeams.listMembers(lead)
+      const advisorBusyNow = Object.values(state.tasks).some((meta) => meta.running === true)
       const workers = state.pool.map((member) => {
+        if (isVirtualMember(member)) {
+          return {
+            name: member.name,
+            model: member.model,
+            status: advisorBusyNow ? 'running' : 'idle',
+            virtual: true,
+          }
+        }
         const row = finalRoster.find((candidate) => candidate.name === member.name)
         return { name: member.name, model: member.model, status: row?.status ?? 'missing' }
       })
@@ -1680,7 +2160,8 @@ function apply(ctx) {
         flowTasks.length > 0 &&
         pending.length === 0 &&
         inProgress.length === 0 &&
-        workers.every((worker) => worker.status !== 'running' && worker.status !== 'provisioning')
+        advisorBusyNow !== true &&
+        workers.every((worker) => worker.virtual === true || (worker.status !== 'running' && worker.status !== 'provisioning'))
       // 清掉本次未命中的冷 worker 模型提示（已唤醒过的会被 agent/created 消费）。
       for (let index = PENDING_HINTS.length - 1; index >= 0; index -= 1) {
         if (PENDING_HINTS[index].expectedAgentId !== undefined) PENDING_HINTS.splice(index, 1)
@@ -1765,9 +2246,6 @@ function apply(ctx) {
       const model = typeof args.model === 'string' && args.model.trim() !== '' ? args.model.trim() : config.aesthetic.model
       const timeoutSeconds = clampInteger(args.timeout_seconds, 180, 30, 600)
 
-      const subagents = ctx.get('subagents')
-      if (subagents === undefined || subagents === null) throw new Error('aesthetic_advice 需要 subagents 服务：请在插件页启用它')
-
       const runId = `${new Date().toISOString().replace(/[:.]/gu, '-').replace('T', '_').slice(0, 19)}-${randomUUID().slice(0, 8)}`
       const cwd = resolveWorkingDirectory(ctx, lead)
       const resultFile = path.join(cwd, AESTHETIC_DIR_NAME, runId, 'advice.md')
@@ -1776,7 +2254,10 @@ function apply(ctx) {
       } catch {
         /* 目录建不出来就让审美顾问自己建 */
       }
-      const prompt = buildAestheticPrompt({
+      const outcome = await reviewWithAesthetic(ctx, {
+        lead,
+        provider,
+        model,
         target,
         focus,
         context,
@@ -1784,65 +2265,22 @@ function apply(ctx) {
         resultFile,
         runId,
         timeoutSeconds,
+        signal: exec.signal,
       })
-      const outerSignal = exec.signal ?? new AbortController().signal
-      const startedAt = Date.now()
-      let activation
-      try {
-        activation = await subagents.startActivation({
-          provider: 'spawn',
-          label: 'aesthetic advisor',
-          delivery: 'parent',
-          signal: AbortSignal.any([outerSignal, AbortSignal.timeout(timeoutSeconds * 1000)]),
-          request: {
-            prompt: [{ type: 'text', text: prompt }],
-            parent: lead,
-            agentOptions: { provider, model },
-          },
-        })
-      } catch (error) {
-        throw new Error(`审美顾问调用失败：${errorMessage(error)}`)
-      }
-
-      let result
-      let failure
-      let budgetTimer
-      try {
-        // 硬超时：除了把 AbortSignal 传给 startActivation，还在这里用 Promise.race 兜住
-        // activation.result（子代理可能不响应 abort）；到点立即释放子代理并返回已落盘的部分建议。
-        result = await Promise.race([
-          activation.result,
-          new Promise((_resolve, reject) => {
-            budgetTimer = setTimeout(() => {
-              reject(new Error(`审美顾问超时（${timeoutSeconds}s，已中断）`))
-            }, timeoutSeconds * 1000)
-          }),
-        ])
-      } catch (error) {
-        failure = errorMessage(error)
-      } finally {
-        if (budgetTimer !== undefined) clearTimeout(budgetTimer)
-      }
-      const applied = readAppliedRoute(ctx, activation.childId)
-      try {
-        await activation.dispose()
-      } catch {
-        /* 释放失败不影响建议 */
-      }
-      const fileText = readResultFile(resultFile)
-      const advice = (fileText ?? blocksToText(result?.output)).trim()
-      if (advice.length === 0 && failure !== undefined) throw new Error(`审美顾问调用失败：${failure}`)
       return jsonSafe({
         runId,
-        provider,
-        model,
-        actualProvider: applied?.provider,
-        actualModel: applied?.model,
-        elapsedMs: Date.now() - startedAt,
-        timedOut: /超时|timed? out|abort/iu.test(failure ?? ''),
-        ...(failure === undefined ? {} : { error: failure }),
+        provider: outcome.provider,
+        model: outcome.model,
+        actualProvider: outcome.actualProvider,
+        actualModel: outcome.actualModel,
+        elapsedMs: outcome.elapsedMs,
+        timedOut: outcome.timedOut,
+        ...(outcome.error === undefined ? {} : { error: outcome.error }),
         file: resultFile,
-        advice: advice.length > TOOL_OUTPUT_LIMIT ? `${advice.slice(0, TOOL_OUTPUT_LIMIT)}\n…（建议过长已截断）` : advice,
+        advice:
+          outcome.advice.length > TOOL_OUTPUT_LIMIT
+            ? `${outcome.advice.slice(0, TOOL_OUTPUT_LIMIT)}\n…（建议过长已截断）`
+            : outcome.advice,
       })
     },
   })
@@ -1903,6 +2341,8 @@ export {
   GO_MODELS,
   RUNS_DIR_NAME,
   AESTHETIC_DIR_NAME,
+  AESTHETIC_MEMBER_NAME,
+  AESTHETIC_TASK_TIMEOUT_SECONDS,
   modelMemberName,
   memberNameFromModel,
   defaultMembers,
@@ -1912,10 +2352,18 @@ export {
   defaultConfig,
   normalizeConfig,
   normalizeMembers,
+  normalizeMemberOverride,
+  aestheticMember,
+  isVirtualMember,
+  splitVirtualMembers,
+  callableMembers,
+  assignSubtasks,
   defaultAesthetic,
   normalizeAesthetic,
   buildAestheticPrompt,
   formatAestheticOutput,
+  formatToolOutput,
+  formatFlowOutput,
   readTeamPolicy,
   teamSnapshot,
   buildModelCatalog,
