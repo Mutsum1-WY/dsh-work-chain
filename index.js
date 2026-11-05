@@ -22,6 +22,8 @@
  *   成员（插件页成员区只读一行、成员计数含它，不占团队智能体槽位）；`work_chain` 的
  *   `subtasks[].member` 或 `work_flow` 的 `tasks[].member` 写 `aesthetic` 即点名派活，
  *   宿主直接拉起一次性审美子代理并把摘要写回任务板，不点名不会跑。
+ * - **成员模型锁定（v0.8.1）**：DSH 0.2.2 起 `agent/request` waterfall 不允许改路由，改用
+ *   官方 `agent.model.select()` 记录成员模型；旧运行时没有该 API 时自动回退到旧 hook。
  *
  * 第三方插件约束：本文件不 import 任何 `@deepseek-ai/*` 包，只用 Node 内置模块。
  * 核心依赖的是运行时 service 契约（tools / subagents / agentTeams / webServer）。
@@ -387,46 +389,64 @@ function throwIfAborted(signal) {
 
 /**
  * 把一个 agent 的模型请求锁定到指定 provider/model。
- * 与官方 `@deepseek-ai/dsh-agent` 的 `installModelSelection` 同套路：在该 agent 的
- * scoped context 上挂 `system-prompt/assemble`（同步 prompt 变量）与 `agent/request`
- * （waterfall 改写本次调用的 LlmCallConfig），不改任何共享服务。
+ *
+ * DSH 0.2.2 起：模型路由在 step 准备阶段就已固定，`agent/request` waterfall 之后会校验
+ * 提议的 provider/model 必须与 step selection 一致（不一致直接抛错）。因此新版本改用
+ * 官方 `agent.model.select({provider, model})` 记录一次模型选择，让下一步用该路由。
+ * 旧版本（无 `agent.model.select`）回退到 scoped waterfall（system-prompt/assemble +
+ * agent/request）的旧做法；不 patch 任何共享服务。
  * @param {object} agent - 目标 agent（Teammate）。
  * @param {{provider: string, model: string}} selection - 要锁定的模型。
  * @returns {() => void} 卸载函数（重复调用安全）。
  */
 function installForcedModel(agent, selection) {
-  if (agent === undefined || agent === null || agent.ctx === undefined) return () => {}
+  if (agent === undefined || agent === null) return () => {}
   const previous = FORCED_MODELS.get(agent.id)
   if (previous !== undefined) previous()
   let disposed = false
-  const disposeAssembly = agent.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
-    const assembled = await next()
-    return {
-      ...assembled,
-      variables: { ...assembled.variables, provider: selection.provider, model: selection.model },
-    }
-  })
-  const disposeRequest = agent.ctx.on('agent/request', async (_payload, next) => {
-    const resolved = await next()
-    const { reasoningEffort: _inheritedEffort, ...withoutInheritedEffort } = resolved
-    return { ...withoutInheritedEffort, provider: selection.provider, model: selection.model }
-  })
+  let disposeAssembly
+  let disposeRequest
   const dispose = () => {
     if (disposed) return
     disposed = true
     try {
-      disposeAssembly()
+      disposeAssembly?.()
     } catch {
       /* fiber 已释放 */
     }
     try {
-      disposeRequest()
+      disposeRequest?.()
     } catch {
       /* fiber 已释放 */
     }
     if (FORCED_MODELS.get(agent.id) === dispose) FORCED_MODELS.delete(agent.id)
   }
   FORCED_MODELS.set(agent.id, dispose)
+
+  // 新契约：记录 durable model/selection，后续 step 以它为 selection（agent/request 不必也不可再改路由）。
+  const model = agent.model
+  if (model !== undefined && model !== null && typeof model.select === 'function') {
+    try {
+      model.select({ provider: selection.provider, model: selection.model })
+      return dispose
+    } catch {
+      /* 选择失败时回退到旧版 hook（例如 agent 尚未就绪） */
+    }
+  }
+
+  if (agent.ctx === undefined) return dispose
+  disposeAssembly = agent.ctx.on('system-prompt/assemble', async (_assembly, _context, next) => {
+    const assembled = await next()
+    return {
+      ...assembled,
+      variables: { ...assembled.variables, provider: selection.provider, model: selection.model },
+    }
+  })
+  disposeRequest = agent.ctx.on('agent/request', async (_payload, next) => {
+    const resolved = await next()
+    const { reasoningEffort: _inheritedEffort, ...withoutInheritedEffort } = resolved
+    return { ...withoutInheritedEffort, provider: selection.provider, model: selection.model }
+  })
   return dispose
 }
 

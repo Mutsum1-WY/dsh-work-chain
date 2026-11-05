@@ -12,6 +12,8 @@
 
 > **v0.8.0 审美顾问算进可调用成员**：启用审美顾问后，它以固定名字 **`aesthetic`** 出现在可调用成员里（插件页成员区会多一行，成员计数含它），**不占团队智能体槽位**。`work_chain` 里用 `subtasks[].member: "aesthetic"`、`work_flow` 里用 `tasks[].member: "aesthetic"` 就能把任务派给它；不点名时不会自动跑。详见下文「审美顾问」与「成员生命周期」。
 
+> **v0.8.1 适配 DSH 0.2.2**：DSH 0.2.2 起模型路由在 step 准备阶段固定，`agent/request` waterfall 只能读不能改（改了会校验失败）。v0.8.1 的成员模型锁定改用官方 `agent.model.select()`（旧版本没有该 API 时自动回退到旧 hook）；否则在 0.2.2 上 `work_chain`/`work_flow` 会报 `teammate "…" initial prompt was not durably accepted`。
+
 ## 它怎么工作（一句话版）
 
 1. 你在顶栏把当前会话切到想当 leader 的模型；
@@ -37,7 +39,7 @@
 
 ## 依赖
 
-- DSH 0.2.1-rc.3（Desktop / Web profile）；
+- DSH 0.2.x（实测 0.2.1-rc.3、0.2.2-rc.1；Desktop / Web profile）；
 - **内置 Agent Teams 组合包已启用**：`@deepseek-ai/dsh-experimental-agent-team-profile`（缺少它时本插件这一行不会激活）。
 - **宿主 `llm` 服务（DSH 内置）**：宿主半 `index.js` 的 `inject` 增加了 `'llm'`（浏览器半 `dsh.client.inject` 仍是 `slots`/`locale`，不需要 llm），用于 `ctx.llm.listProviders()` / `ctx.llm.listModels()` 读取成员下拉的供应商与模型目录；宿主未提供时插件会退回兜底目录（见下文）；
 - 任意模型 provider；默认成员统一为 `opencode-go` / `deepseek-v4.1-flash`（v0.5.0 起，原 4 个不同模型的默认成员已全部改为 flash）。其它模型（如 `deepseek-v4-pro` / `claude-haiku-5-5` / `kimi-k3`）需 provider 有有效凭据且 DSH LLM 可路由，`minimax-*` 等在 DSH LLM 里不可路由（会失败）时，除非你另外接了对应 provider。
@@ -360,6 +362,7 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 | 点名 `aesthetic` 的任务一直 pending（v0.8.0） | 任务板只允许 `in_progress` 的任务 complete；v0.8.0 会由宿主先 claim 再写摘要/complete。若仍卡住：确认组合包已重载到 v0.8.0，必要时在任务板手动 claim → complete |
 | 点名 `aesthetic` 的成员提示「审美顾问超时」 | 审美子代理到预算上限被硬中断：已写进 advice/结果文件的部分建议照常返回，任务仍会结算；把链的 `timeout_seconds` 或单次审美预算调大（≤600） |
 | 某个成员 spawn 失败 | 模型/provider 在该会话不可用（`opencode-go` 需要有效凭据）；在配置里换模型后重试；错误会写进该成员条目 |
+| `work_chain`/`work_flow` 报 `teammate "…" initial prompt was not durably accepted`（DSH 0.2.2+） | v0.8.0 及更早版本用 `agent/request` waterfall 改模型路由；DSH 0.2.2 起该 waterfall 之后会校验路由、不允许改写，导致成员创建失败 | 升级到 **v0.8.1+**（改用 `agent.model.select()` 锁定模型），升级后重载组合包 |
 | 全部成员都没跑起来 | 看 `list_bundles` 的 `subagent-spawn-in-process` 行是否活跃；设置里的智能体上限是否已满（默认 8） |
 | 结果文件缺失但任务完成 | 成员偷懒没写文件；摘要仍在任务板里，工具输出会标 `结果文件缺失` |
 | 下拉里没有某个供应商 | 该供应商未在 DSH 设置中配置或凭据无效：到 DSH 设置里配置该供应商/凭据，然后在插件卡片点「重新加载」 |
