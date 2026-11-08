@@ -14,6 +14,8 @@
 
 > **v0.8.1 适配 DSH 0.2.2**：DSH 0.2.2 起模型路由在 step 准备阶段固定，`agent/request` waterfall 只能读不能改（改了会校验失败）。v0.8.1 的成员模型锁定改用官方 `agent.model.select()`（旧版本没有该 API 时自动回退到旧 hook）；否则在 0.2.2 上 `work_chain`/`work_flow` 会报 `teammate "…" initial prompt was not durably accepted`。
 
+> **v0.8.2 审美顾问给足时间**：完整审美评审往往要几分钟，之前的默认预算（`aesthetic_advice` 180 秒、虚拟成员任务 180 秒）经常到点被硬中断，界面上还一律显示「超时」。v0.8.2 把默认预算调到 **900 秒（15 分钟）**、上限 **1800 秒**；链里的虚拟成员不再跟链的 `timeout_seconds` 一起被砍（至少 900 秒，链预算更大时跟随链预算）。如果预算真的用完但结果文件里已有建议，按**「部分完成」**返回（`note` 说明，不再报失败/超时错误），提示词也要求它**先写一版结论再继续补充**，避免被中断时什么都没有。
+
 ## 它怎么工作（一句话版）
 
 1. 你在顶栏把当前会话切到想当 leader 的模型；
@@ -190,7 +192,7 @@ agent 会调用：
     { "title": "审美评审", "prompt": "评审 apps/web/dist/index.html 的配色、间距与字号层级，给 3~5 条具体建议", "member": "aesthetic" },
     { "title": "实现", "prompt": "根据评审建议修改样式", "member": "deepseek-v4-1-flash" }
   ],
-  "timeout_seconds": 300
+  "timeout_seconds": 900
 }
 ```
 
@@ -274,7 +276,7 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 
 - **独立**：它看不到 leader 的上下文，只根据你传的 `target` / `focus` / `context` 和配置里的审美偏好自己去看（可以读文件、看图片、浏览网页）；
 - **只给建议、不改文件**：不会改代码、也不会改待审对象；完整建议写在 `.aesthetic/<runId>/advice.md`，工具输出只回给 leader 摘要 + 建议文件路径；
-- **一次性子代理**：每次调用新建、跑完即释放（不进团队名册、不占团队常驻槽位）；评审过程可能用到文件/截图/浏览器等工具，默认 180 秒预算，到点硬中断并返回已落盘的部分建议；
+- **一次性子代理**：每次调用新建、跑完即释放（不进团队名册、不占团队常驻槽位）；评审过程可能用到文件/截图/浏览器等工具，默认 **900 秒**预算（最长 1800），到点硬中断；已有落盘建议时按部分完成返回，不报失败；
 - **leader 专用**：只有 Team Lead 能调用，teammate 调用会报「只能由 Team Lead 调用」；什么时候审、审完要不要采纳、这次用哪个模型，都由 leader（当前会话）决定；
 - **受插件页配置控制**：启用开关关闭时调用会直接报错并提示去插件页开启；默认模型 `opencode-go` / `deepseek-v4.1-flash`，可在配置卡片改；「审美偏好 / 标准」会拼进它的提示词（留空则只用通用标准）。
 
@@ -286,6 +288,7 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 - **`work_flow`**：`tasks[].member` 写 `"aesthetic"`；宿主在常驻 worker 之外单独执行这个审美任务（同时只跑一个），建议写到 `.workflow/<flowRun>/<taskId>.md`，完成后作为 `completedNow` 返回（owner 显示 `aesthetic`）。
 - `members` 参数里也可以写一项 `{ "name": "aesthetic" }`（provider/model 会用插件页「审美顾问」的配置），表示本次调用确保虚拟成员在册。
 - 不点名时不会自动跑；单独的 `aesthetic_advice` 工具用法不受影响。
+- **等待预算（v0.8.2）**：`aesthetic_advice` 默认 900 秒（最长 1800）；`work_chain` 里的虚拟成员取 `max(900, 链 timeout_seconds)`（上限 1800），不跟真实成员的链预算一起被砍；`work_flow` 里默认 900。预算用完但结果文件已有建议时按部分完成结算（任务板照常 complete，`note` 说明是部分建议）。
 
 ### 参数
 
@@ -296,7 +299,7 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 | `context` | string | 否 | 背景：给谁看、要达到什么目的、已知约束 |
 | `provider` | string | 否 | 本次调用临时覆盖 provider（默认用配置值） |
 | `model` | string | 否 | 本次调用临时覆盖模型（默认用配置值） |
-| `timeout_seconds` | number | 否 | 本次等待预算，30~600 秒，默认 180；到点会**硬中断**，子代理已写进结果文件的部分建议照常返回 |
+| `timeout_seconds` | number | 否 | 本次等待预算，30~1800 秒，默认 **900**（完整评审通常要几分钟，别轻易调小）；到点会**硬中断**，已写进结果文件的部分建议按「部分完成」照常返回（`note` 说明，不报失败） |
 
 ```json
 {
@@ -308,7 +311,7 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 
 （也可以只传 `target`；`target` 是描述时，它会按描述评审，不会假装看到了不存在的文件。）
 
-**时间预算**：`timeout_seconds` 会同时写进它的提示词（让它优先给结论、不要跑超出预算的长时间测评），并在宿主侧**硬中断**——到点仍未完成时返回 `timedOut: true`，它已经写进 `advice.md` 的部分建议照常返回；要更深的评审（如多分辨率真机截图）就把 `timeout_seconds` 调到 300~600。
+**时间预算**：`timeout_seconds` 会同时写进它的提示词（让它优先给结论、不要跑超出预算的长时间测评；并要求**先写一版结论再继续补充**，避免被中断时没有产出），默认 **900 秒**、最长 **1800 秒**。宿主侧仍会在预算用完时硬中断，但如果它已经往结果文件里写了建议，就按**部分完成**返回（`timedOut: true` + `note` 说明），不算失败；只有在预算内一条建议都没产出时才会报错。要更完整的评审（如多分辨率真机截图）可以把 `timeout_seconds` 调到 1200~1800。
 
 ### 它给出的建议结构
 
@@ -327,12 +330,13 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 | `provider` / `model` | 本次使用的（配置值或参数覆盖后的）路由 |
 | `actualProvider` / `actualModel` | 子代理自报的实际请求路由（读不到时缺省） |
 | `elapsedMs` | 耗时（毫秒） |
-| `timedOut` | 是否因超时/中断结束 |
+| `timedOut` | 是否因到达等待预算被中断（此时若已产出建议，按部分完成返回） |
+| `note` | 部分完成时的说明（预算用完但已拿到部分建议）；完整完成时不出现 |
 | `error` | 有异常但已经拿到建议时附带的错误消息（没有则不出现） |
 | `file` | 建议文件绝对路径 `<cwd>/.aesthetic/<runId>/advice.md` |
 | `advice` | 建议正文（工具输出里截到 48000 字符，完整内容看文件） |
 
-工具输出给 leader 的首行是 `【审美顾问】<provider>/<model> · <N>s · 建议文件 <path>`，空行后是建议正文。
+工具输出给 leader 的首行是 `【审美顾问】<provider>/<model> · <N>s · 建议文件 <path>`，空行后是建议正文；部分完成时首行会写「达到等待预算，返回部分建议」并在第二行给出 `说明：…`。
 
 ### 结果文件
 
@@ -345,7 +349,7 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 - **结果文件**：成员把完整 Markdown 写在 `.workchain/<runId>/<member>.md`（工具输出会读回；太长会截断，完整内容看文件）。
 - **审美建议文件（v0.6.0）**：`aesthetic_advice` 的建议写在 `<cwd>/.aesthetic/<runId>/advice.md`，不经过团队任务板；工具输出给 leader 的是「首行路由/用时/文件路径 + 建议正文」。完整内容看文件。
 - **审美顾问虚拟成员（v0.8.0）**：`work_chain` 里点名 `aesthetic` 的任务，任务板仍会建一条任务（可见进度），由宿主 claim → 写摘要 → complete；结果按 `completed` 计。`work_flow` 里点名 `aesthetic` 的任务结果文件在 `.workflow/<flowRun>/<taskId>.md`。
-- **超时**：到 `timeoutSeconds` 仍未完成会返回 `timedOut: true` 并打断仍在运行的成员，已完成的成员结果照常返回。
+- **超时**：到 `timeoutSeconds` 仍未完成会返回 `timedOut: true` 并打断仍在运行的成员，已完成的成员结果照常返回。审美顾问（虚拟成员）单独给预算（默认 900 秒、上限 1800），不跟链的 `timeout_seconds` 一起被砍；预算用完但已有建议时按部分完成结算。
 
 ## 排障
 
@@ -357,10 +361,11 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 | 报 `只能由 Team Lead 调用` | members 是 teammate，teammate 不能发起新的工作链；由 Lead 调用 |
 | `aesthetic_advice` 报「审美顾问已在插件页关闭」（v0.6.0） | 到「插件」页 → 工作链配置卡片的「审美顾问」栏勾上「启用审美顾问」并保存，然后重新调用；也可检查 `config.json` 里 `aesthetic.enabled` 是否为 `true` |
 | `aesthetic_advice` 报「只能由 Team Lead 调用」（v0.6.0） | 当前会话不是 Lead（是 teammate/子代理）：换成由你发起的会话（那就是 Lead）再调用 |
-| `aesthetic_advice` 返回 `timedOut: true` / 报「审美顾问调用失败」 | 模型不可路由（provider 无凭据）或超时：在配置卡片换一个可路由的审美模型，或把 `timeout_seconds` 调大（30~600）；`error` 字段里是原始错误 |
+| `aesthetic_advice` 返回 `timedOut: true` / 报「审美顾问调用失败」 | 模型不可路由（provider 无凭据）才报失败；`timedOut: true` 且带 `note` 表示预算用完但已拿到部分建议（不是失败）：把 `timeout_seconds` 调大（默认 900，最大 1800）可拿更完整评审 |
+| `aesthetic_advice` 报「审美顾问在 …s 预算内仍在运行，已中止」 | 预算用完时结果文件里还没有任何建议（例如模型太慢或工具卡住）：把 `timeout_seconds` 调大到 1200~1800 后重试；连续发生就换一个可路由/更快的审美模型 |
 | `work_chain` 报「审美顾问未启用」（v0.8.0） | 在 `subtasks[].member` / `members` 里点名了 `aesthetic`，但插件页「审美顾问」开关是关闭的：开启后重试，或去掉点名 |
 | 点名 `aesthetic` 的任务一直 pending（v0.8.0） | 任务板只允许 `in_progress` 的任务 complete；v0.8.0 会由宿主先 claim 再写摘要/complete。若仍卡住：确认组合包已重载到 v0.8.0，必要时在任务板手动 claim → complete |
-| 点名 `aesthetic` 的成员提示「审美顾问超时」 | 审美子代理到预算上限被硬中断：已写进 advice/结果文件的部分建议照常返回，任务仍会结算；把链的 `timeout_seconds` 或单次审美预算调大（≤600） |
+| 点名 `aesthetic` 的成员提示「审美顾问在预算内仍在运行」 | 审美子代理到预算上限被硬中断且结果文件为空：把链的 `timeout_seconds` 调大（虚拟成员预算取 `max(900, 链预算)`，上限 1800），或先调大 `aesthetic_advice` 的预算单独跑一次确认模型可用 |
 | 某个成员 spawn 失败 | 模型/provider 在该会话不可用（`opencode-go` 需要有效凭据）；在配置里换模型后重试；错误会写进该成员条目 |
 | `work_chain`/`work_flow` 报 `teammate "…" initial prompt was not durably accepted`（DSH 0.2.2+） | v0.8.0 及更早版本用 `agent/request` waterfall 改模型路由；DSH 0.2.2 起该 waterfall 之后会校验路由、不允许改写，导致成员创建失败 | 升级到 **v0.8.1+**（改用 `agent.model.select()` 锁定模型），升级后重载组合包 |
 | 全部成员都没跑起来 | 看 `list_bundles` 的 `subagent-spawn-in-process` 行是否活跃；设置里的智能体上限是否已满（默认 8） |
@@ -392,6 +397,6 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
   只有改动涉及多成员调度（复用/借用/任务板结算）时，才按需补一次多成员测试。
 
 - **虚拟成员自检（v0.8.0）**：可以用 fake ctx + fake Agent Teams/subagents 的一次性脚本覆盖：`aestheticMember`/`callableMembers`/`normalizeMemberOverride`/`assignSubtasks` 纯函数，`work_chain` 点名 `aesthetic`（不 spawn teammate、任务板 claim→编辑→complete、结果在 `.aesthetic/`），`work_flow` 点名 `aesthetic`（虚拟 worker、`completedNow` owner=aesthetic、`done:true`），以及审美顾问关闭时点名报错。脚本只放临时目录、不提交仓库。
-- 审美顾问的真机验证不需要成员：一次 `aesthetic_advice` 调用即可（`target` 传一个本地文件路径，`timeout_seconds` 给 60~120），它不占团队常驻槽位；虚拟成员 `aesthetic` 也可以单独点名跑一条 `work_chain`/`work_flow` 任务验证（同样不占槽位）。
+- 审美顾问的真机验证不需要成员：一次 `aesthetic_advice` 调用即可（`target` 传一个本地文件路径，`timeout_seconds` 不传就用默认 900；快速冒烟可给 120~180），它不占团队常驻槽位；虚拟成员 `aesthetic` 也可以单独点名跑一条 `work_chain`/`work_flow` 任务验证（同样不占槽位）。
 
 MIT License，见 `LICENSE`。第三方插件形态与 `dsh-web-search-opencode` 一致，安装/卸载都走插件管理器。

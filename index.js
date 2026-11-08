@@ -24,6 +24,9 @@
  *   宿主直接拉起一次性审美子代理并把摘要写回任务板，不点名不会跑。
  * - **成员模型锁定（v0.8.1）**：DSH 0.2.2 起 `agent/request` waterfall 不允许改路由，改用
  *   官方 `agent.model.select()` 记录成员模型；旧运行时没有该 API 时自动回退到旧 hook。
+ * - **审美顾问给足时间（v0.8.2）**：默认等待预算 900 秒（上限 1800）；链里的虚拟成员不跟链
+ *   `timeout_seconds` 一起砍（至少 900、链预算更大时跟随）；预算用完但已有落盘建议时按
+ *   「部分完成」返回（`note` 说明），不报超时失败；提示词要求先写一版结论再继续补充。
  *
  * 第三方插件约束：本文件不 import 任何 `@deepseek-ai/*` 包，只用 Node 内置模块。
  * 核心依赖的是运行时 service 契约（tools / subagents / agentTeams / webServer）。
@@ -121,8 +124,10 @@ const RUNS_DIR_NAME = '.workchain'
 const AESTHETIC_DIR_NAME = '.aesthetic'
 /** 内置审美顾问虚拟成员名：不占团队槽位，任务由宿主直接拉起一次性审美子代理执行。 */
 const AESTHETIC_MEMBER_NAME = 'aesthetic'
-/** 审美顾问任务默认/最长等待预算（秒）。 */
-const AESTHETIC_TASK_TIMEOUT_SECONDS = 180
+/** 审美顾问任务默认等待预算（秒）：完整评审常要几分钟，默认给足 15 分钟。 */
+const AESTHETIC_TASK_TIMEOUT_SECONDS = 900
+/** 审美顾问任务允许的最长等待预算（秒），防止子代理无限运行。 */
+const AESTHETIC_MAX_TIMEOUT_SECONDS = 1800
 
 /**
  * 「工作流模式」开启时注入系统提示的一段话：让当前会话默认走 work_flow 调度 + 验收循环，
@@ -848,6 +853,7 @@ function formatToolOutput(value) {
     const virtualLabel = member.virtual === true ? ' · 虚拟成员·审美顾问，不占团队槽位' : ''
     lines.push(`## ${member.name}（${member.provider}/${member.model}）${actual}${virtualLabel}`)
     lines.push(`任务板：${member.taskId} · 状态：${member.taskStatus}${member.fileFound ? ` · 结果文件：${member.file}` : ' · 结果文件缺失'}${member.error === undefined ? '' : ` · 派活错误：${member.error}`}`)
+    if (typeof member.note === 'string' && member.note.length > 0) lines.push(`说明：${member.note}`)
     lines.push('')
     if (member.summary !== undefined && member.summary.length > 0) {
       lines.push(`任务板摘要${member.summarySource === 'file' ? '（任务板未更新，取自结果文件）' : ''}：`)
@@ -883,7 +889,7 @@ function buildAestheticPrompt(options) {
   const budgetSeconds =
     typeof timeoutSeconds === 'number' && Number.isFinite(timeoutSeconds) && timeoutSeconds > 0
       ? Math.round(timeoutSeconds)
-      : 180
+      : AESTHETIC_TASK_TIMEOUT_SECONDS
   return [
     '你是「审美顾问」——一位独立的视觉/界面审美评审。你只给建议，不改任何文件；你不在团队里，也不需要和任何人协作。',
     '',
@@ -905,10 +911,11 @@ function buildAestheticPrompt(options) {
     '- 待审对象不存在或读不到时，直接说明「未找到/无法读取」，不要编造细节。',
     '',
     '## 时间预算',
-    `约 ${budgetSeconds} 秒。优先给结论；不要为了测评跑超出预算的长时间流程（例如多分辨率批量截图、CDP 自动化扫全部视口），到点前先把已有结论写进结果文件。超时会被硬中断。`,
+    `约 ${budgetSeconds} 秒（最长 ${AESTHETIC_MAX_TIMEOUT_SECONDS} 秒）。优先给结论；不要为了测评跑超出预算的长时间流程（例如多分辨率批量截图、CDP 自动化扫全部视口）。`,
+    '**先写后补**：拿到第一版结论就先写进结果文件，再继续补充完善；这样即使到预算上限被中断，leader 也能拿到已产出的建议。',
     '',
     '## 交付要求',
-    `1. 把完整建议写到文件：${resultFile}（目录不存在请先创建）。`,
+    `1. 把完整建议写到文件：${resultFile}（目录不存在请先创建；建议先写一版初稿，之后按需要更新）。`,
     '2. 建议结构：',
     '   - 开头一句总评 + 0~10 分（分数与理由一致，别虚高）。',
     '   - 按影响从大到小排序的问题清单；每条写清「现象 → 为什么不好看 → 怎么改」，修改要具体到颜色/间距/字号/层级/动效/对齐。',
@@ -924,9 +931,12 @@ function buildAestheticPrompt(options) {
 /** aesthetic_advice 的模型可见输出：首行路由/用时/建议文件，空行，然后建议正文。 */
 function formatAestheticOutput(value) {
   const seconds = Math.round((value.elapsedMs ?? 0) / 1000)
+  const partial = value.timedOut === true && value.advice !== undefined && value.advice.length > 0
+  const budgetLabel = value.timedOut !== true ? '' : partial ? '（达到等待预算，返回部分建议）' : '（预算内未完成）'
   const lines = [
-    `【审美顾问】${value.provider}/${value.model}${value.timedOut === true ? '（超时）' : ''} · ${seconds}s · 建议文件 ${value.file}`,
+    `【审美顾问】${value.provider}/${value.model}${budgetLabel} · ${seconds}s · 建议文件 ${value.file}`,
   ]
+  if (typeof value.note === 'string' && value.note.length > 0) lines.push(`说明：${value.note}`)
   if (value.actualModel !== undefined && (value.actualProvider !== value.provider || value.actualModel !== value.model)) {
     lines.push(`实际请求路由：${value.actualProvider}/${value.actualModel}`)
   }
@@ -1012,15 +1022,17 @@ async function reviewWithAesthetic(ctx, options) {
   }
   let result
   let failure
+  let budgetExceeded = false
   let budgetTimer
   try {
-    // 硬超时：除了把 AbortSignal 传给 startActivation，还在这里用 Promise.race 兜住，
-    // 到点立即释放子代理并返回已落盘的部分建议。
+    // 硬预算：除了把 AbortSignal 传给 startActivation，还在这里用 Promise.race 兜住，
+    // 到点立即释放子代理并返回已落盘的部分建议（建议若有内容按「部分完成」处理，不报失败）。
     result = await Promise.race([
       activation.result,
       new Promise((_resolve, reject) => {
         budgetTimer = setTimeout(() => {
-          reject(new Error(`审美顾问超时（${timeoutSeconds}s，已中断）`))
+          budgetExceeded = true
+          reject(new Error(`等待预算 ${timeoutSeconds}s 用完（子代理仍在运行，已中止）`))
         }, timeoutSeconds * 1000)
       }),
     ])
@@ -1037,7 +1049,15 @@ async function reviewWithAesthetic(ctx, options) {
   }
   const fileText = readResultFile(resultFile)
   const advice = (fileText ?? blocksToText(result?.output)).trim()
-  if (advice.length === 0 && failure !== undefined) throw new Error(`审美顾问调用失败：${failure}`)
+  const timedOut = budgetExceeded || /超时|timed? out|abort/iu.test(failure ?? '')
+  if (advice.length === 0 && failure !== undefined) {
+    if (budgetExceeded) {
+      throw new Error(
+        `审美顾问在 ${timeoutSeconds}s 预算内仍在运行，已中止；本次没有拿到建议（可在调用时加大 timeout_seconds，最长 ${AESTHETIC_MAX_TIMEOUT_SECONDS} 秒后重试）`,
+      )
+    }
+    throw new Error(`审美顾问调用失败：${failure}`)
+  }
   return {
     advice,
     provider,
@@ -1046,8 +1066,13 @@ async function reviewWithAesthetic(ctx, options) {
     actualModel: applied?.model,
     childId: activation.childId,
     elapsedMs: Date.now() - startedAt,
-    timedOut: /超时|timed? out|abort/iu.test(failure ?? ''),
-    ...(failure === undefined ? {} : { error: failure }),
+    timedOut,
+    ...(budgetExceeded && advice.length > 0
+      ? {
+          note: `达到 ${timeoutSeconds}s 等待预算，返回的是已产出的部分建议（不是失败）；需要更完整的评审可加大 timeout_seconds（最长 ${AESTHETIC_MAX_TIMEOUT_SECONDS} 秒）`,
+        }
+      : {}),
+    ...(failure === undefined || budgetExceeded ? {} : { error: failure }),
   }
 }
 
@@ -1147,17 +1172,18 @@ async function runFlowAdvisorTask(ctx, agentTeams, lead, options) {
       runId,
       timeoutSeconds,
     })
+    const summary = outcome.note === undefined ? outcome.advice : `${outcome.advice}\n\n（${outcome.note}）`
     try {
       fs.mkdirSync(runDir, { recursive: true })
       fs.writeFileSync(
         resultFile,
-        outcome.advice.length > 0 ? outcome.advice : `（审美顾问没有返回建议${outcome.error === undefined ? '' : `：${outcome.error}`}）`,
+        summary.length > 0 ? summary : `（审美顾问没有返回建议${outcome.error === undefined ? '' : `：${outcome.error}`}）`,
         'utf8',
       )
     } catch {
       /* 结果文件写不进就只靠任务板摘要 */
     }
-    await completeAdvisorTask(agentTeams, lead, taskId, title, resultFile, outcome.advice, outcome.error)
+    await completeAdvisorTask(agentTeams, lead, taskId, title, resultFile, summary, outcome.error)
     if (meta !== undefined) meta.error = outcome.error
   } catch (error) {
     const message = errorMessage(error)
@@ -1544,6 +1570,12 @@ function apply(ctx) {
       }
       const advisorRuns = []
       const advisorResults = new Map()
+      // 审美顾问单独给预算：链的 timeout_seconds 主要是给真实成员的，慢评审不该跟着被砍；
+      // 至少给默认值，链预算更大时跟随链预算，但不超过上限。
+      const advisorTimeoutSeconds = Math.min(
+        AESTHETIC_MAX_TIMEOUT_SECONDS,
+        Math.max(timeoutSeconds, AESTHETIC_TASK_TIMEOUT_SECONDS),
+      )
       for (const item of created) {
         throwIfAborted(signal)
         if (isVirtualMember(item.member)) {
@@ -1559,10 +1591,18 @@ function apply(ctx) {
                 styleNotes: config.aesthetic.styleNotes,
                 resultFile: item.resultFile,
                 runId,
-                timeoutSeconds: Math.min(600, timeoutSeconds),
+                timeoutSeconds: advisorTimeoutSeconds,
                 signal,
               })
-              await completeAdvisorTask(agentTeams, lead, item.taskId, item.title, item.resultFile, outcome.advice, outcome.error)
+              await completeAdvisorTask(
+                agentTeams,
+                lead,
+                item.taskId,
+                item.title,
+                item.resultFile,
+                outcome.note === undefined ? outcome.advice : `${outcome.advice}\n\n（${outcome.note}）`,
+                outcome.error,
+              )
               advisorResults.set(item.taskId, outcome)
             } catch (error) {
               const message = errorMessage(error)
@@ -1720,6 +1760,7 @@ function apply(ctx) {
           actualModel: applied?.model,
           modelLocked: virtual ? false : item.modelLocked === true,
           ...(virtual ? { virtual: true } : {}),
+          ...(advisorOutcome?.note === undefined ? {} : { note: advisorOutcome.note }),
           taskId: item.taskId,
           taskStatus: task?.status ?? 'missing',
           summary,
@@ -2208,7 +2249,7 @@ function apply(ctx) {
   const disposeAestheticTool = ctx.tools.register({
     name: 'aesthetic_advice',
     description:
-      'Ask the independent Aesthetic Advisor — a disposable subagent with its own model — to review what you delivered: a UI file, a screenshot, a URL, or a described design. It returns ranked, concrete visual-design advice (layout/composition, color, type scale, spacing & alignment, consistency, motion & detail) and never edits project files: the full advice is written to .aesthetic/<runId>/advice.md and only a short summary comes back to you. The call hard-stops after timeout_seconds (default 180) and returns whatever advice already reached the result file. Use it when a task includes visual or interface quality (UI pages, charts, slide/visuals, copy layout) and you want a second, independent aesthetic opinion. Only the Team Lead may call it. Default model: opencode-go/deepseek-v4.1-flash. Enable it, change its model, or add your own aesthetic preferences on the Work Chain bundle page.',
+      'Ask the independent Aesthetic Advisor — a disposable subagent with its own model — to review what you delivered: a UI file, a screenshot, a URL, or a described design. It returns ranked, concrete visual-design advice (layout/composition, color, type scale, spacing & alignment, consistency, motion & detail) and never edits project files: the full advice is written to .aesthetic/<runId>/advice.md and only a short summary comes back to you. Thorough reviews take several minutes: the default budget is 900s (up to 1800s), and when the budget runs out the call returns whatever advice already reached the result file as a partial result (not a failure). Use it when a task includes visual or interface quality (UI pages, charts, slide/visuals, copy layout) and you want a second, independent aesthetic opinion. Only the Team Lead may call it. Default model: opencode-go/deepseek-v4.1-flash. Enable it, change its model, or add your own aesthetic preferences on the Work Chain bundle page.',
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -2236,7 +2277,8 @@ function apply(ctx) {
         },
         timeout_seconds: {
           type: 'number',
-          description: 'How long the advisor may run, 30-600 seconds. Defaults to 180.',
+          description:
+            'How long the advisor may run, 30-1800 seconds. Defaults to 900: thorough reviews often need several minutes, so do not lower it unless you only need a quick opinion.',
         },
       },
     },
@@ -2264,7 +2306,7 @@ function apply(ctx) {
       const provider =
         typeof args.provider === 'string' && args.provider.trim() !== '' ? args.provider.trim() : config.aesthetic.provider
       const model = typeof args.model === 'string' && args.model.trim() !== '' ? args.model.trim() : config.aesthetic.model
-      const timeoutSeconds = clampInteger(args.timeout_seconds, 180, 30, 600)
+      const timeoutSeconds = clampInteger(args.timeout_seconds, AESTHETIC_TASK_TIMEOUT_SECONDS, 30, AESTHETIC_MAX_TIMEOUT_SECONDS)
 
       const runId = `${new Date().toISOString().replace(/[:.]/gu, '-').replace('T', '_').slice(0, 19)}-${randomUUID().slice(0, 8)}`
       const cwd = resolveWorkingDirectory(ctx, lead)
@@ -2295,6 +2337,7 @@ function apply(ctx) {
         actualModel: outcome.actualModel,
         elapsedMs: outcome.elapsedMs,
         timedOut: outcome.timedOut,
+        ...(outcome.note === undefined ? {} : { note: outcome.note }),
         ...(outcome.error === undefined ? {} : { error: outcome.error }),
         file: resultFile,
         advice:
@@ -2363,6 +2406,7 @@ export {
   AESTHETIC_DIR_NAME,
   AESTHETIC_MEMBER_NAME,
   AESTHETIC_TASK_TIMEOUT_SECONDS,
+  AESTHETIC_MAX_TIMEOUT_SECONDS,
   modelMemberName,
   memberNameFromModel,
   defaultMembers,
@@ -2381,6 +2425,7 @@ export {
   defaultAesthetic,
   normalizeAesthetic,
   buildAestheticPrompt,
+  reviewWithAesthetic,
   formatAestheticOutput,
   formatToolOutput,
   formatFlowOutput,
