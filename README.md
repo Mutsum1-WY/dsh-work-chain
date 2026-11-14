@@ -16,12 +16,14 @@
 
 > **v0.8.2 审美顾问给足时间**：完整审美评审往往要几分钟，之前的默认预算（`aesthetic_advice` 180 秒、虚拟成员任务 180 秒）经常到点被硬中断，界面上还一律显示「超时」。v0.8.2 把默认预算调到 **900 秒（15 分钟）**、上限 **1800 秒**；链里的虚拟成员不再跟链的 `timeout_seconds` 一起被砍（至少 900 秒，链预算更大时跟随链预算）。如果预算真的用完但结果文件里已有建议，按**「部分完成」**返回（`note` 说明，不再报失败/超时错误），提示词也要求它**先写一版结论再继续补充**，避免被中断时什么都没有。
 
+> **v0.9.0 适配 DSH 0.2.2 的「Agent Teams = 子代理」**：0.2.2 起内置团队只保留任务板，创建/名册/消息/中断改由 `subagents` 服务承担（`membership`、`listMembers`、`spawnTeammate` 等旧方法已移除）。插件内部加了一层团队兼容层，把旧接口映射到 `ctx.subagents.startActivation` / `listDescendants` / `resolveName` / `sendMessage` / `interrupt`：创建成员用 `agentOptions` 固定模型，名册改读子代理树，`owner` 自动解析成 Session id；首次调用会自动为 Lead 会话开启 Team 模式；成员名上限随之收紧为 32 字符。
+
 ## 它怎么工作（一句话版）
 
 1. 你在顶栏把当前会话切到想当 leader 的模型；
 2. 在「插件」页 → 已安装插件 → **工作链** 的配置卡片里配好 members（provider / model；name 已按模型名自动预填，也可手改）；
 3. 对 agent 说「用工作链做 XXX」（或直接让它调 `work_chain`）；
-4. 插件为每个成员在团队名册里建/复用 teammate，按各自模型运行；
+4. 插件为每个成员在 Lead 的子代理树里建/复用 worker，按各自模型运行；
 5. 成员把完整结果写到 `.workchain/<runId>/<member>.md`，并把摘要写进团队任务板；
 6. 插件收集结果（任务板摘要 + 结果文件）交回 leader 汇总。
 
@@ -29,33 +31,33 @@
 
 ## 为什么能「每个 member 不同模型」
 
-- **成员就是 Agent Teams teammate**：内置 `spawn_teammate` 没有模型参数，插件在 `agent/created`（serial）里认出刚创建的 teammate，在它的 scoped context 上挂 `agent/request` / `system-prompt/assemble` waterfall（与官方 `installModelSelection` 同套路），把每次模型请求固定为配置的 `provider/model`。
+- **成员就是内置子代理（Agent Teams worker）**：插件用 `ctx.subagents.startActivation({ provider: 'spawn', agentOptions: { provider, model }, ... })` 在 Lead 名下建 worker，模型在创建时就写入子代理的 AgentOptions；
+- **复用/唤醒前再锁一次**：对已有的活成员调用 `agent.model.select({ provider, model })`（0.2.x 唯一的步骤前模型选择入口），冷成员在唤醒时通过会话里的 model-selection 事件生效；
+- 不 patch 任何共享服务方法。
 
 因此：
 
 - 每个成员都用**自己配置的模型**运行；
-- 成员是真正的 Agent Teams teammate（团队 UI、消息、任务板、跨调用复用）；
-- 不 patch 任何共享服务方法，插件卸载/HMR 时相关监听一起回收。
-
-> 注意：team 名册（`list_agents`）里显示的 `model` 可能仍是继承值，工具输出里的模型以成员配置与 `actualModel` 为准。
+- 成员是真正的子代理（子代理导航 / `list_agents`、`send_message`、任务板、跨调用复用）；
+- 工具输出里的 `actualModel` 来自成员会话最近一次请求头，可用于核对路由。
 
 ## 依赖
 
-- DSH 0.2.x（实测 0.2.1-rc.3、0.2.2-rc.1；Desktop / Web profile）；
-- **内置 Agent Teams 组合包已启用**：`@deepseek-ai/dsh-experimental-agent-team-profile`（缺少它时本插件这一行不会激活）。
+- DSH 0.2.2-rc.3（Desktop / Web profile，Agent Teams 已是子代理模型；0.2.1 及更早请用 v0.8.x）；
+- **内置 Agent Teams 组合包已启用**（`agent-team` + `tool-agent-team` + `subagent` + `subagent-spawn-in-process`；缺少时本插件这一行不会激活）；Team 模式是按会话开关，插件在第一次调用时自动为 Lead 打开；
 - **宿主 `llm` 服务（DSH 内置）**：宿主半 `index.js` 的 `inject` 增加了 `'llm'`（浏览器半 `dsh.client.inject` 仍是 `slots`/`locale`，不需要 llm），用于 `ctx.llm.listProviders()` / `ctx.llm.listModels()` 读取成员下拉的供应商与模型目录；宿主未提供时插件会退回兜底目录（见下文）；
 - 任意模型 provider；默认成员统一为 `opencode-go` / `deepseek-v4.1-flash`（v0.5.0 起，原 4 个不同模型的默认成员已全部改为 flash）。其它模型（如 `deepseek-v4-pro` / `claude-haiku-5-5` / `kimi-k3`）需 provider 有有效凭据且 DSH LLM 可路由，`minimax-*` 等在 DSH LLM 里不可路由（会失败）时，除非你另外接了对应 provider。
 - **审美顾问（v0.6.0）不引入新的外部依赖**：复用已注入的 `subagents`（拉起一次性评审子代理）与 `agentTeams`（校验调用者是 Lead），不需要额外安装包或新服务；但它的模型同样要求 provider 有有效凭据且 DSH LLM 可路由，不可路由时 `aesthetic_advice` 直接报错。
 
 ## 已知限制（实测）
 
-- **成员槽位有限且不可回收**：团队 teammate 总数 = 设置里的智能体上限（desktop 默认 8），名册不能删成员。每次调用会先复用同名成员、再用空余槽位；不够就跳过并报告。想扩员就新开一个对话或调大设置上限。
-- **内置团队偶发 provisioning 竞态**：`spawnTeammate` 可能报 `initial prompt was not durably accepted`（agent-team 的 `checkpointInitialPrompt` 竞态，与成员模型无关）。插件会自动换名字重试一次；仍失败时该成员标记为 `派活错误`，其余成员照常完成，失败任务会从任务板删除。
+- **成员槽位受子代理上限约束**：worker 是 Lead 名下的子代理，总数受 `subagents.maxActiveSubagents`（默认 8）限制；名册不能删成员。每次调用会先复用同名成员、再用空余槽位；不够就跳过并报告。想扩员就新开一个对话或调大上限。
+- **成员名必须是 1–32 个 lower-kebab 字符、以字母开头、不能叫 `lead`**（子代理命名规则）；旧配置里超长或数字开头的名字需要改短。
 - **任务板 description 的 16KB 上限 + 成员可能写不回摘要**：个别模型调用 `team_task_update` 时参数可能丢失，此时任务板 description 仍是原始派活文本；插件会自动退回**用结果文件内容**做摘要（输出里 `summarySource: file`），结果不丢。
-- **成员的模型锁定靠 agent scoped event**（`agent/request` + `system-prompt/assemble` waterfall），不 patch 任何共享服务；团队名册里显示的 `model` 可能仍是继承值，以工具输出的 `actualModel` 为准。
+- **成员的模型锁定靠 `agent.model.select()`**（步骤前模型选择），不 patch 任何共享服务；`list_agents` 显示的是子代理树的成员，工具输出里的 `actualModel` 才是实际路由。
 - **复用旧成员偶尔会失败**：如果被复用的成员处于异常状态（cold resume / 上一次 turn 失败），唤醒可能失败并表现为该成员超时；换用新会话最稳，失败成员不会自动清理。
 - **GUI 配置卡片在页面 boot 时装配**：如果安装/更新后当前页面没出现「工作链成员配置」卡片，刷新页面一次；仍没有就重启一次 DSH（客户端模块图在启动时扫描）。
-- **审美顾问是一次性子代理、跑完即释放（v0.6.0）**：不进团队名册、不占团队槽位，也不保留上下文——每次调用都是全新评审（同一对象想复测就再调一次）；它的模型/provider 需 DSH LLM 可路由，不可路由时工具直接报错；建议落在 `.aesthetic/<runId>/advice.md`，该目录与 `.workchain/`、`.workflow/` 同为运行时产物，需自行清理。
+- **审美顾问是一次性子代理、跑完即释放（v0.6.0）**：不进成员名册、不占子代理槽位，也不保留上下文——每次调用都是全新评审（同一对象想复测就再调一次）；它的模型/provider 需 DSH LLM 可路由，不可路由时工具直接报错；建议落在 `.aesthetic/<runId>/advice.md`，该目录与 `.workchain/`、`.workflow/` 同为运行时产物，需自行清理。
 
 ## 安装
 
@@ -149,10 +151,10 @@ https://github.com/Mutsum1-WY/dsh-work-chain
 - **跟随模型**：在配置卡片里改 provider / model 时，如果名字是自动生成的（纯模型名或 `-N` 后缀），名字会自动跟着新模型改；手填的名字（如 `writer-1`）保持不动。
 - **留空也行（API/工具/配置文件）**：`members[].name` 为空时，宿主会按该成员的模型自动补名（仍按上面的规则去重）；插件页配置卡片会自动预填名字，手工清空会提示「成员名不能为空」。
 - **旧配置迁移**：v0.6.0 及更早的默认名 `pro` / `haiku` / `kimi` / `ds-flash` 会在**读配置时自动迁移**（内存里生效，重名同样 `-2`、`-3`…）；下次在插件页「保存」（或切换工作流模式开关）时会把迁移结果与 `namingVersion: 2` 落盘，之后不再迁移。想保留自定义名字，改完保存即可。
-- **升级提示（旧对话）**：v0.6.1 前已经建好的 teammate 名字还是旧的（`pro`/`haiku` 等），不会被新名字复用；旧对话里跑 team 模式 / `work_flow` 时若槽位不够会跳过并提示——**新开一个对话**（团队名册从 0 开始）再跑即可。
-- 名字仍可手改，但必须满足 lower-kebab-case 且 ≤64 字符——**中文/空格/点号不能直接用在队友名里**，这是 DSH 内置团队的限制。
+- **升级提示（旧对话）**：v0.6.1 前已经建好的成员名字还是旧的（`pro`/`haiku` 等），不会被新名字复用；旧对话里跑 `work_flow` 时若槽位不够会跳过并提示——**新开一个对话**（成员名册从 0 开始）再跑即可。
+- 名字仍可手改，但必须满足 lower-kebab-case、以字母开头且 ≤32 字符（v0.9.0 起子代理命名规则）——**中文/空格/点号不能直接用在成员名里**，这是 DSH 内置子代理的限制。
 
-> 为什么不是中文「一号、二号」？内置 Agent Teams 的 `spawn_teammate` 只接受 lower-kebab-case 名字，中文会被内核以 `TEAM_INVALID_MEMBER_NAME` 拒绝，所以用 `-2`、`-3` 表示二号、三号；工具输出、任务板与团队名册里都沿用这些名字，方便互相对应。
+> 为什么不是中文「一号、二号」？内置子代理只接受 1–32 个 lower-kebab-case 名字（不能占用树根保留名 `lead`），中文会被内核以 `INVALID_AGENT_NAME` 拒绝，所以用 `-2`、`-3` 表示二号、三号；工具输出、任务板与成员名册里都沿用这些名字，方便互相对应。
 
 ## 用法
 
@@ -243,11 +245,11 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 
 ### 成员生命周期与智能体数量
 
-- 成员都是常驻 Agent Teams teammate：出现在团队 UI、能读写任务板、跨调用同名复用；数量受**设置里的智能体上限**约束，槽位不足时跳过并报告。
-- **虚拟成员 `aesthetic`（v0.8.0）**：启用审美顾问时自动算进「可调用成员」列表（插件页成员区多一行、成员计数含它），但**不是 teammate、不占智能体槽位、不出现在团队名册**；派活时由宿主直接拉起一次性审美子代理，任务板任务由宿主 claim 后写摘要并 complete。同一时刻只跑一个审美任务。
-- 实时读取内置团队当前生效的 `maxMembers`（`runtime` = 运行中团队服务，设置改动热更新后立即跟随；退回 `config` 读 agent-team 配置行；最后回退 8）。
-- 规划顺序：同名 teammate 直接复用（不占新槽位）→ 还有空槽就按该成员模型新建 → 槽位已满则该成员**跳过并报告**（不换模型、不挪用其它成员）。
-- 槽位不够时：**新开一个对话**（团队成员从 0 开始），或到**设置**里把智能体上限调大；插件下一次调用/保存即跟随。
+- 成员都是 Lead 名下的常驻子代理：出现在子代理导航（`list_agents`）、能读写任务板、跨调用同名复用；数量受**子代理上限**（`subagents.maxActiveSubagents`，默认 8）约束，槽位不足时跳过并报告。
+- **虚拟成员 `aesthetic`（v0.8.0）**：启用审美顾问时自动算进「可调用成员」列表（插件页成员区多一行、成员计数含它），但**不是常驻成员、不占子代理槽位、不出现在成员名册**；派活时由宿主直接拉起一次性审美子代理，任务板任务由宿主 claim 后写摘要并 complete。同一时刻只跑一个审美任务。
+- 实时读取子代理容量：0.2.x 从设置里的 `maxActiveSubagents` 读取（读不到时按默认 8），设置改动后在插件页「重新加载」即可看到新容量。
+- 规划顺序：同名成员直接复用（不占新槽位）→ 还有空槽就按该成员模型新建 → 槽位已满则该成员**跳过并报告**（不换模型、不挪用其它成员）。
+- 槽位不够时：**新开一个对话**（成员从 0 开始），或到**设置 → 子代理**里把上限调大；插件下一次调用/保存即跟随。
 
 ### 配置字段
 
@@ -276,8 +278,8 @@ worker 全程复用：同一批 teammate 跨多次 `work_flow` 调用持续接�
 
 - **独立**：它看不到 leader 的上下文，只根据你传的 `target` / `focus` / `context` 和配置里的审美偏好自己去看（可以读文件、看图片、浏览网页）；
 - **只给建议、不改文件**：不会改代码、也不会改待审对象；完整建议写在 `.aesthetic/<runId>/advice.md`，工具输出只回给 leader 摘要 + 建议文件路径；
-- **一次性子代理**：每次调用新建、跑完即释放（不进团队名册、不占团队常驻槽位）；评审过程可能用到文件/截图/浏览器等工具，默认 **900 秒**预算（最长 1800），到点硬中断；已有落盘建议时按部分完成返回，不报失败；
-- **leader 专用**：只有 Team Lead 能调用，teammate 调用会报「只能由 Team Lead 调用」；什么时候审、审完要不要采纳、这次用哪个模型，都由 leader（当前会话）决定；
+- **一次性子代理**：每次调用新建、跑完即释放（不进成员名册、不占子代理常驻槽位）；评审过程可能用到文件/截图/浏览器等工具，默认 **900 秒**预算（最长 1800），到点硬中断；已有落盘建议时按部分完成返回，不报失败；
+- **leader 专用**：只有 Team Lead 能调用，非 Lead 的成员调用会报「只能由 Team Lead 调用」；什么时候审、审完要不要采纳、这次用哪个模型，都由 leader（当前会话）决定；
 - **受插件页配置控制**：启用开关关闭时调用会直接报错并提示去插件页开启；默认模型 `opencode-go` / `deepseek-v4.1-flash`，可在配置卡片改；「审美偏好 / 标准」会拼进它的提示词（留空则只用通用标准）。
 
 ### 作为可调用成员（v0.8.0）

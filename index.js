@@ -66,9 +66,12 @@ const DEFAULT_MODEL = 'deepseek-v4.1-flash'
 /** 读取单个供应商模型列表的超时，避免某个 provider 卡住整个目录。 */
 const CATALOG_TIMEOUT_MS = 8000
 
-/** 成员名上限：内置 Agent Teams 要求 lower-kebab-case 且 ≤64 字符；给 -NN 后缀留出余量。 */
-const MEMBER_NAME_MAX = 64
-const MEMBER_NAME_SLUG_MAX = 48
+/**
+ * 成员名上限：0.2.x 起成员就是内置子代理，名字必须是 1–32 个 lower-kebab 字符、
+ * 以字母开头、且不能占用树根保留名 `lead`；这里给 -NN 后缀留出余量。
+ */
+const MEMBER_NAME_MAX = 32
+const MEMBER_NAME_SLUG_MAX = 30
 /** 旧版默认成员名（模型别名）；读取旧配置时迁移成模型名（v0.6.1）。 */
 const LEGACY_DEFAULT_MEMBER_NAMES = Object.freeze(['pro', 'haiku', 'kimi', 'ds-flash'])
 /** 配置命名版本：2 = 成员名默认由模型名生成；旧配置读入时自动迁移到 2。 */
@@ -80,14 +83,18 @@ const CONFIG_NAMING_VERSION = 2
  * `deepseek-v4-1-flash`；中文/空格/下划线等非法字符一律折叠成单个 `-`。
  */
 function modelMemberName(model) {
-  const slug = String(model ?? '')
+  let slug = String(model ?? '')
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9]+/gu, '-')
     .replace(/^-+|-+$/gu, '')
     .slice(0, MEMBER_NAME_SLUG_MAX)
     .replace(/-+$/gu, '')
-  return slug === '' ? 'member' : slug
+  if (slug === '') return 'member'
+  // 子代理名必须以字母开头，且 `lead` 是树根保留名。
+  if (!/^[a-z]/u.test(slug)) slug = `m-${slug}`.slice(0, MEMBER_NAME_SLUG_MAX)
+  if (slug === 'lead') slug = 'lead-1'
+  return slug
 }
 
 /** 按模型名取不重复成员名：第一个用纯模型名，重名追加 -2、-3…（即二号、三号）。 */
@@ -115,7 +122,9 @@ function defaultMembers() {
 /** 默认成员快照（只读；需要可变副本时调用 defaultMembers()）。 */
 const DEFAULT_MEMBERS = Object.freeze(defaultMembers())
 
-const MEMBER_NAME = /^[a-z0-9]+(?:-[a-z0-9]+)*$/u
+const MEMBER_NAME = /^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/u
+/** 子代理树根保留名：成员不能叫它。 */
+const RESERVED_MEMBER_NAME = 'lead'
 const CONFIG_ROUTE = '/plugin-api/work-chain/config'
 const WORKFLOW_MODE_ROUTE = '/plugin-api/work-chain/workflow-mode'
 const WORKFLOW_SECTION = 'work-chain:workflow-mode'
@@ -175,9 +184,9 @@ function normalizeMembers(input) {
     if (model.length === 0) throw new Error(`members[${index}].model 不能为空`)
     // v0.6.1：名字留空 = 默认取模型名（重名自动 -2、-3…）。
     const memberName = rawName === '' ? memberNameFromModel(model, seen) : rawName
-    if (!MEMBER_NAME.test(memberName) || memberName.length > MEMBER_NAME_MAX) {
+    if (!MEMBER_NAME.test(memberName) || memberName.length > MEMBER_NAME_MAX || memberName === RESERVED_MEMBER_NAME) {
       throw new Error(
-        `members[${index}].name 必须是 lower-kebab-case（^[a-z0-9]+(-[a-z0-9]+)*$，≤${MEMBER_NAME_MAX} 字符），收到 ${JSON.stringify(raw.name)}`,
+        `members[${index}].name 必须是以字母开头的 lower-kebab-case（^[a-z][a-z0-9]*(-[a-z0-9]+)*$，≤${MEMBER_NAME_MAX} 字符，且不能是 lead），收到 ${JSON.stringify(raw.name)}`,
       )
     }
     if (seen.has(memberName)) throw new Error(`成员名重复：${memberName}`)
@@ -402,7 +411,7 @@ function throwIfAborted(signal) {
  * agent/request）的旧做法；不 patch 任何共享服务。
  * @param {object} agent - 目标 agent（Teammate）。
  * @param {{provider: string, model: string}} selection - 要锁定的模型。
- * @returns {() => void} 卸载函数（重复调用安全）。
+ * @returns {() => void} 卸载函数（重复调用安全；select 是持久事件，这里只做簿记）。
  */
 function installForcedModel(agent, selection) {
   if (agent === undefined || agent === null) return () => {}
@@ -528,9 +537,9 @@ function sendJson(res, status, value) {
 }
 
 /**
- * 读取内置团队「智能体上限」：以设置里实际生效的值为准（运行中团队服务的
- * `roster.maxMembers`，设置改动会热更新到它），而不是写死数字。设置读不到时回退到
- * 配置编辑器里的 agent-team 行，再回退 8。
+ * 读取「智能体上限」：0.2.x 起成员就是子代理，容量由 `subagents.maxActiveSubagents`
+ * 决定（默认 8），运行中的团队服务不再暴露 roster。设置编辑器里读得到生效值就用它
+ * （`subagent` 行的 maxActiveSubagents，兼容旧的 agent-team 行 maxMembers），否则回退 8。
  * @returns {{maxMembers: number, source: 'runtime'|'config'|'fallback'}}
  */
 function readTeamPolicy(ctx) {
@@ -542,12 +551,16 @@ function readTeamPolicy(ctx) {
   }
   try {
     const rows = ctx.get('configEditor')?.configuration?.() ?? []
-    const row = rows.find((candidate) => candidate.entry?.options?.id === 'agent-team')
+    const row = rows.find((candidate) => {
+      const id = candidate.entry?.options?.id
+      const moduleName = candidate.entry?.options?.name ?? ''
+      return id === 'subagent' || id === 'agent-team' || moduleName.includes('dsh-subagent')
+    })
     if (row !== undefined) {
       const override = row.override ?? {}
       const inherited = row.inherited ?? {}
       const effective = Object.keys(override).length > 0 ? override : inherited
-      const value = effective.maxMembers
+      const value = effective.maxActiveSubagents ?? effective.maxMembers
       if (Number.isInteger(value) && value > 0) return { maxMembers: Math.min(64, value), source: 'config' }
     }
   } catch {
@@ -557,14 +570,15 @@ function readTeamPolicy(ctx) {
 }
 
 /** 团队容量快照：智能体上限、已用成员、剩余可新建数。 */
-function teamSnapshot(ctx) {
+async function teamSnapshot(ctx) {
   const policy = readTeamPolicy(ctx)
   let used = 0
   try {
-    const teams = ctx.get('agentTeams')
+    const subagents = ctx.get('subagents')
     const lead = ctx.get('agents')?.roots?.()[0]
-    if (teams !== undefined && lead !== undefined) {
-      used = teams.listMembers(lead).filter((row) => row.role !== 'lead').length
+    if (subagents !== undefined && lead !== undefined) {
+      const rows = await subagents.listDescendants(lead.session?.header?.id ?? lead.id)
+      used = rows.filter((row) => row.kind === 'child').length
     }
   } catch {
     /* 拿不到就按 0 */
@@ -575,6 +589,113 @@ function teamSnapshot(ctx) {
     limitSource: policy.source,
     usedMembers: used,
     remainingSlots: Math.max(0, policy.maxMembers - used),
+  }
+}
+
+/**
+ * 确保 Lead 会话已开启内置 Agent Teams。0.2.x 起 Team 是按会话开关（默认关闭），
+ * 而任务板在未开启时会直接拒绝（TEAM_DISABLED）；工作链本来就以团队为执行面，
+ * 所以第一次调用时替用户打开。
+ * @param {object} ctx - cordis 插件上下文。
+ * @param {object} lead - 当前 Team Lead agent。
+ */
+async function ensureTeamMode(ctx, lead) {
+  const teams = ctx.get('agentTeams')
+  if (teams === undefined || teams === null) return
+  try {
+    if (teams.isEnabled(lead) === true) return
+    await teams.setEnabled(lead, true)
+  } catch {
+    /* 打不开就让后续任务板调用报出真实错误 */
+  }
+}
+
+/**
+ * 团队接口适配层。
+ *
+ * DSH 0.2.x 把 Agent Teams 改成「成员即子代理」：任务板仍由 `agentTeams` 提供，
+ * 但创建/名册/消息/中断改由 `subagents`（`startActivation` / `listDescendants` /
+ * `resolveName` / `sendMessage` / `interrupt`）承担，`membership`、`listMembers`、
+ * `spawnTeammate` 等旧方法已移除。这里把插件内部使用的旧接口映射到新服务，
+ * 调用点保持原有语义；名册与创建是异步的，因此对应方法返回 Promise。
+ * @param {object} ctx - cordis 插件上下文（需 agents / subagents / agentTeams）。
+ * @returns {object} 旧团队接口形状的适配对象。
+ */
+function createTeamCompat(ctx) {
+  const subagents = () => {
+    const service = ctx.get('subagents')
+    if (service === undefined || service === null) throw new Error('需要内置 subagents 服务：请在插件页启用内置 Agent Teams / 子代理')
+    return service
+  }
+  const teams = () => {
+    const service = ctx.get('agentTeams')
+    if (service === undefined || service === null) throw new Error('需要内置 Agent Teams：请在插件页启用它')
+    return service
+  }
+  const signalOf = (signal) => signal ?? new AbortController().signal
+  const blocksOf = (content) =>
+    Array.isArray(content) ? content : [{ type: 'text', text: String(content ?? '') }]
+  const statusOf = (id) => {
+    const live = ctx.get('agents')?.get?.(id)
+    return live?.status === 'running' ? 'running' : 'inactive'
+  }
+  return {
+    membership(caller) {
+      const root = subagents().rootOf(caller)
+      return { role: root === caller ? 'lead' : 'member', root }
+    },
+    async listMembers(caller) {
+      const service = subagents()
+      const root = service.rootOf(caller)
+      const rows = await service.listDescendants(root.session?.header?.id ?? root.id)
+      const list = [{ id: root.session?.header?.id ?? root.id, name: 'lead', role: 'lead', status: statusOf(root.id) }]
+      for (const row of rows) {
+        if (row.kind !== 'child' || row.mode !== 'continuable') continue
+        list.push({
+          id: row.id,
+          name: row.path ?? row.id,
+          role: 'teammate',
+          status: statusOf(row.id),
+          mode: row.mode,
+        })
+      }
+      return list
+    },
+    async spawnTeammate(caller, options) {
+      const started = await subagents().startActivation({
+        provider: options.provider ?? 'spawn',
+        label: String(options.description ?? options.name ?? 'work-chain member').slice(0, 190),
+        ...(options.name === undefined ? {} : { name: options.name }),
+        prompt: blocksOf(options.prompt),
+        parent: caller,
+        ...(options.agentOptions === undefined ? {} : { agentOptions: options.agentOptions }),
+        signal: signalOf(options.signal),
+        delivery: 'caller',
+      })
+      return { member: { id: started.childId, name: started.name }, childId: started.childId, name: started.name }
+    },
+    async sendMessage(caller, options) {
+      const service = subagents()
+      const signal = signalOf(options.signal)
+      const target = await service.resolveName(caller, String(options.target), signal)
+      return service.sendMessage(caller, target, blocksOf(options.content), { signal })
+    },
+    async interrupt(caller, target) {
+      const service = subagents()
+      const id = await service.resolveName(caller, String(target), new AbortController().signal)
+      service.interrupt(id, { kind: 'ancestor', agent: caller })
+    },
+    createTask: (caller, request) => teams().createTask(caller, request),
+    getTask: (caller, taskId) => teams().getTask(caller, taskId),
+    listTasks: (caller) => teams().listTasks(caller),
+    async updateTask(caller, request) {
+      const service = subagents()
+      const next = { ...request }
+      if (typeof next.owner === 'string' && next.owner.length > 0) {
+        next.owner = await service.resolveName(caller, next.owner, new AbortController().signal)
+      }
+      return teams().updateTask(caller, next)
+    },
   }
 }
 
@@ -722,7 +843,7 @@ function installConfigRoute(ctx) {
     path: CONFIG_ROUTE,
     async handler(req, res) {
       try {
-        const team = teamSnapshot(ctx)
+        const team = await teamSnapshot(ctx)
         if (req.method === 'GET') {
           const catalog = await buildModelCatalog(ctx)
           const config = readConfig()
@@ -1009,13 +1130,11 @@ async function reviewWithAesthetic(ctx, options) {
     activation = await subagents.startActivation({
       provider: 'spawn',
       label: 'aesthetic advisor',
-      delivery: 'parent',
+      delivery: 'caller',
       signal: AbortSignal.any([outerSignal, AbortSignal.timeout(timeoutSeconds * 1000)]),
-      request: {
-        prompt: [{ type: 'text', text: prompt }],
-        parent: lead,
-        agentOptions: { provider, model },
-      },
+      prompt: [{ type: 'text', text: prompt }],
+      parent: lead,
+      agentOptions: { provider, model },
     })
   } catch (error) {
     throw new Error(`审美顾问调用失败：${errorMessage(error)}`)
@@ -1202,7 +1321,7 @@ async function runFlowAdvisorTask(ctx, agentTeams, lead, options) {
 /** 保证工作流的 worker 池存在：同名 teammate 复用（并重新锁定模型），缺的空槽新建。 */
 async function ensureFlowPool(ctx, agentTeams, lead, members, notes, signal) {
   const policy = readTeamPolicy(ctx)
-  const roster = agentTeams.listMembers(lead)
+  const roster = await agentTeams.listMembers(lead)
   const teammates = roster.filter((row) => row.role !== 'lead')
   const reusable = new Map(teammates.filter((row) => row.status !== 'failed').map((row) => [row.name, row]))
   let slotsLeft = Math.max(0, policy.maxMembers - teammates.length)
@@ -1233,6 +1352,7 @@ async function ensureFlowPool(ctx, agentTeams, lead, members, notes, signal) {
         prompt: [{ type: 'text', text: `你是「工作流」的常驻 worker ${spawnName}（模型 ${member.model}）。回一句「worker ready」即可，然后等 Lead 派任务。` }],
         context: 'fresh',
         provider: 'spawn',
+        agentOptions: { provider: member.provider, model: member.model },
         signal,
       })
       slotsLeft -= 1
@@ -1249,7 +1369,7 @@ async function ensureFlowPool(ctx, agentTeams, lead, members, notes, signal) {
 
 /** 唤醒/通知一个 worker：冷成员先挂模型锁定提示，活成员直接重锁模型，再发消息。 */
 async function wakeFlowWorker(ctx, agentTeams, lead, spec, prompt, signal) {
-  const roster = agentTeams.listMembers(lead)
+  const roster = await agentTeams.listMembers(lead)
   const row = roster.find((candidate) => candidate.name === spec.name)
   const live = row === undefined ? undefined : ctx.get('agents')?.get?.(row.id)
   if (row !== undefined && live === undefined) {
@@ -1411,12 +1531,13 @@ function apply(ctx) {
       render: (_args, value) => [{ type: 'text', text: formatToolOutput(value) }],
     },
     async execute(args, exec) {
-      const agentTeams = ctx.get('agentTeams')
-      if (agentTeams === undefined || agentTeams === null) throw new Error('work_chain 需要内置 Agent Teams：请在插件页启用它')
+      if (ctx.get('agentTeams') === undefined || ctx.get('agentTeams') === null) throw new Error('work_chain 需要内置 Agent Teams：请在插件页启用它')
+      const agentTeams = createTeamCompat(ctx)
       const lead = exec.agent
       if (lead === undefined) throw new Error('work_chain 必须由 agent 调用')
       const membership = agentTeams.membership(lead)
       if (membership.role !== 'lead') throw new Error('work_chain 只能由 Team Lead 调用')
+      await ensureTeamMode(ctx, lead)
       const signal = exec.signal
       throwIfAborted(signal)
 
@@ -1443,7 +1564,7 @@ function apply(ctx) {
       const cwd = resolveWorkingDirectory(ctx, lead)
       const runDir = path.join(cwd, RUNS_DIR_NAME, runId)
 
-      const roster = agentTeams.listMembers(lead)
+      const roster = await agentTeams.listMembers(lead)
       const teammatesBefore = roster.filter((row) => row.role !== 'lead')
       const reusableByName = new Map(teammatesBefore.filter((row) => row.status !== 'failed').map((row) => [row.name, row]))
       const notes = []
@@ -1653,6 +1774,7 @@ function apply(ctx) {
                   prompt: [{ type: 'text', text: item.prompt }],
                   context: 'fresh',
                   provider: 'spawn',
+                  agentOptions: { provider: item.member.provider, model: item.member.model },
                   signal,
                 })
                 spawnError = undefined
@@ -1808,7 +1930,7 @@ function apply(ctx) {
         for (const member of membersOut) {
           if (member.taskStatus !== 'completed' && member.virtual !== true) {
             try {
-              agentTeams.interrupt(lead, member.spawnName)
+              await agentTeams.interrupt(lead, member.spawnName)
             } catch {
               /* 已 inactive 或不存在时忽略 */
             }
@@ -1907,12 +2029,13 @@ function apply(ctx) {
       render: (_args, value) => [{ type: 'text', text: formatFlowOutput(value) }],
     },
     async execute(args, exec) {
-      const agentTeams = ctx.get('agentTeams')
-      if (agentTeams === undefined || agentTeams === null) throw new Error('work_flow 需要内置 Agent Teams：请在插件页启用它')
+      if (ctx.get('agentTeams') === undefined || ctx.get('agentTeams') === null) throw new Error('work_flow 需要内置 Agent Teams：请在插件页启用它')
+      const agentTeams = createTeamCompat(ctx)
       const lead = exec.agent
       if (lead === undefined) throw new Error('work_flow 必须由 agent 调用')
       const membership = agentTeams.membership(lead)
       if (membership.role !== 'lead') throw new Error('work_flow 只能由 Team Lead 调用')
+      await ensureTeamMode(ctx, lead)
       const signal = exec.signal
       throwIfAborted(signal)
 
@@ -2006,7 +2129,7 @@ function apply(ctx) {
       // 3) 卡死处理：worker 已空闲但任务仍是 in_progress
       const now = Date.now()
       const board = agentTeams.listTasks(lead)
-      const rosterNow = agentTeams.listMembers(lead)
+      const rosterNow = await agentTeams.listMembers(lead)
       const statusByName = new Map(rosterNow.filter((row) => row.role !== 'lead').map((row) => [row.name, row.status]))
       for (const [taskId, meta] of Object.entries(state.tasks)) {
         const view = board.find((row) => row.id === taskId)
@@ -2070,7 +2193,7 @@ function apply(ctx) {
         assigned.push({ taskId: view.id, title: view.subject, worker: worker.name })
       }
       const assignReadyTasks = async () => {
-        const roster = agentTeams.listMembers(lead)
+        const roster = await agentTeams.listMembers(lead)
         const realPool = state.pool.filter((member) => !isVirtualMember(member))
         const idle = roster.filter(
           (row) => row.role !== 'lead' && row.status === 'inactive' && realPool.some((member) => member.name === row.name),
@@ -2177,7 +2300,7 @@ function apply(ctx) {
             row.ready === true,
         )
         const advisorBusy = Object.values(state.tasks).some((meta) => meta.running === true)
-        const roster = agentTeams.listMembers(lead)
+        const roster = await agentTeams.listMembers(lead)
         const realPool = state.pool.filter((member) => !isVirtualMember(member))
         const idleCount = roster.filter(
           (row) => row.role !== 'lead' && row.status === 'inactive' && realPool.some((member) => member.name === row.name),
@@ -2203,7 +2326,7 @@ function apply(ctx) {
       const pending = flowTasks.filter((row) => row.status === 'pending')
       const inProgress = flowTasks.filter((row) => row.status === 'in_progress')
       const completed = flowTasks.filter((row) => row.status === 'completed')
-      const finalRoster = agentTeams.listMembers(lead)
+      const finalRoster = await agentTeams.listMembers(lead)
       const advisorBusyNow = Object.values(state.tasks).some((meta) => meta.running === true)
       const workers = state.pool.map((member) => {
         if (isVirtualMember(member)) {
@@ -2287,12 +2410,13 @@ function apply(ctx) {
       render: (_args, value) => [{ type: 'text', text: formatAestheticOutput(value) }],
     },
     async execute(args, exec) {
-      const agentTeams = ctx.get('agentTeams')
-      if (agentTeams === undefined || agentTeams === null) throw new Error('aesthetic_advice 需要内置 Agent Teams：请在插件页启用它')
+      if (ctx.get('agentTeams') === undefined || ctx.get('agentTeams') === null) throw new Error('aesthetic_advice 需要内置 Agent Teams：请在插件页启用它')
+      const agentTeams = createTeamCompat(ctx)
       const lead = exec.agent
       if (lead === undefined) throw new Error('aesthetic_advice 必须由 agent 调用')
       const membership = agentTeams.membership(lead)
       if (membership.role !== 'lead') throw new Error('aesthetic_advice 只能由 Team Lead 调用')
+      await ensureTeamMode(ctx, lead)
       throwIfAborted(exec.signal)
 
       const config = readConfig()
