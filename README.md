@@ -18,6 +18,8 @@
 
 > **v0.9.0 适配 DSH 0.2.2 的「Agent Teams = 子代理」**：0.2.2 起内置团队只保留任务板，创建/名册/消息/中断改由 `subagents` 服务承担（`membership`、`listMembers`、`spawnTeammate` 等旧方法已移除）。插件内部加了一层团队兼容层，把旧接口映射到 `ctx.subagents.startActivation` / `listDescendants` / `resolveName` / `sendMessage` / `interrupt`：创建成员用 `agentOptions` 固定模型，名册改读子代理树，`owner` 自动解析成 Session id；首次调用会自动为 Lead 会话开启 Team 模式；成员名上限随之收紧为 32 字符。
 
+> **v0.9.1 修复子代理名册 / 容量 / owner**：0.2.2-rc.3 的本地子代理目录条目没有 `path` 字段，v0.9.0 用 `row.path ?? row.id` 取名会让长会话里的历史子代理全都变成「成员」——复用匹配不到、容量被历史记录占满（表现为「没有可用的智能体槽位」），任务板 reassign 的 owner 也停在名字上（worker 无法 edit/complete）。v0.9.1 改为：成员名优先取目录 `name`，没有就从插件 label（`work-chain member …` / `work-flow worker …`）解析；容量只数**在线**成员，历史成员保留用于冷唤醒复用；reassign 的 owner 统一解析成 Session id。
+
 ## 它怎么工作（一句话版）
 
 1. 你在顶栏把当前会话切到想当 leader 的模型；

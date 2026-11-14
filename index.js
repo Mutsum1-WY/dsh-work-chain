@@ -639,27 +639,63 @@ function createTeamCompat(ctx) {
     const live = ctx.get('agents')?.get?.(id)
     return live?.status === 'running' ? 'running' : 'inactive'
   }
+  // 0.2.2-rc.3 的本地子代理目录条目还没有 name（version 0），只有 label；
+  // 因此成员名从插件的 label（work-chain member / work-flow worker）里解析，
+  // 同时兼容将来带 name 的目录版本。没有 label/name 的子代理（例如一次性审美顾问）不算团队成员。
+  const WORKER_LABEL = /^(?:work-chain member|work-flow worker)\s+([a-z0-9][a-z0-9-]{0,31})\b/u
+  const workerNameOf = (row) => {
+    if (typeof row.name === 'string' && row.name.length > 0) return row.name
+    if (typeof row.label !== 'string') return undefined
+    const matched = WORKER_LABEL.exec(row.label)
+    return matched === null ? undefined : matched[1]
+  }
+  /** 读取 Lead 子代理树里所有带插件 label 的成员（含已释放的历史成员，可用于冷唤醒复用）。 */
+  const workerRows = async (caller, signal) => {
+    const service = subagents()
+    const root = service.rootOf(caller)
+    const rows = await service.listDescendants(root.session?.header?.id ?? root.id, signal)
+    const workers = []
+    for (const row of rows) {
+      if (row.kind !== 'child' || row.mode !== 'continuable') continue
+      const name = workerNameOf(row)
+      if (name === undefined) continue
+      const live = ctx.get('agents')?.get?.(row.id)
+      workers.push({
+        id: row.id,
+        name,
+        live: live !== undefined,
+        status: live?.status === 'running' ? 'running' : 'inactive',
+      })
+    }
+    return { root, workers }
+  }
+  const liveRows = async (caller, signal) => {
+    const { root, workers } = await workerRows(caller, signal)
+    return { root, workers: workers.filter((worker) => worker.live) }
+  }
+  const resolveTargetId = async (caller, target, signal) => {
+    const { workers } = await workerRows(caller, signal)
+    const hit = workers.find((worker) => worker.name === String(target))
+    if (hit !== undefined) return hit.id
+    return subagents().resolveName(caller, String(target), signal)
+  }
   return {
     membership(caller) {
       const root = subagents().rootOf(caller)
       return { role: root === caller ? 'lead' : 'member', root }
     },
     async listMembers(caller) {
-      const service = subagents()
-      const root = service.rootOf(caller)
-      const rows = await service.listDescendants(root.session?.header?.id ?? root.id)
+      const { root, workers } = await workerRows(caller)
       const list = [{ id: root.session?.header?.id ?? root.id, name: 'lead', role: 'lead', status: statusOf(root.id) }]
-      for (const row of rows) {
-        if (row.kind !== 'child' || row.mode !== 'continuable') continue
-        list.push({
-          id: row.id,
-          name: row.path ?? row.id,
-          role: 'teammate',
-          status: statusOf(row.id),
-          mode: row.mode,
-        })
+      for (const worker of workers) {
+        list.push({ id: worker.id, name: worker.name, role: 'teammate', status: worker.status, mode: 'continuable' })
       }
       return list
+    },
+    /** 真正占子代理容量（在线/常驻）的成员；历史成员不占容量，但可以冷唤醒复用。 */
+    async liveMembers(caller) {
+      const { workers } = await liveRows(caller)
+      return workers.map((worker) => ({ id: worker.id, name: worker.name, role: 'teammate', status: worker.status }))
     },
     async spawnTeammate(caller, options) {
       const started = await subagents().startActivation({
@@ -677,22 +713,22 @@ function createTeamCompat(ctx) {
     async sendMessage(caller, options) {
       const service = subagents()
       const signal = signalOf(options.signal)
-      const target = await service.resolveName(caller, String(options.target), signal)
+      const target = await resolveTargetId(caller, options.target, signal)
       return service.sendMessage(caller, target, blocksOf(options.content), { signal })
     },
     async interrupt(caller, target) {
       const service = subagents()
-      const id = await service.resolveName(caller, String(target), new AbortController().signal)
+      const id = await resolveTargetId(caller, target, new AbortController().signal)
       service.interrupt(id, { kind: 'ancestor', agent: caller })
     },
     createTask: (caller, request) => teams().createTask(caller, request),
     getTask: (caller, taskId) => teams().getTask(caller, taskId),
     listTasks: (caller) => teams().listTasks(caller),
     async updateTask(caller, request) {
-      const service = subagents()
       const next = { ...request }
       if (typeof next.owner === 'string' && next.owner.length > 0) {
-        next.owner = await service.resolveName(caller, next.owner, new AbortController().signal)
+        // 0.2.2-rc.3 的任务板按 Session id 认 owner；成员名要先从子代理目录解析成 id。
+        next.owner = await resolveTargetId(caller, next.owner, new AbortController().signal)
       }
       return teams().updateTask(caller, next)
     },
@@ -1324,7 +1360,9 @@ async function ensureFlowPool(ctx, agentTeams, lead, members, notes, signal) {
   const roster = await agentTeams.listMembers(lead)
   const teammates = roster.filter((row) => row.role !== 'lead')
   const reusable = new Map(teammates.filter((row) => row.status !== 'failed').map((row) => [row.name, row]))
-  let slotsLeft = Math.max(0, policy.maxMembers - teammates.length)
+  const liveTeammates =
+    typeof agentTeams.liveMembers === 'function' ? (await agentTeams.liveMembers(lead)).length : teammates.length
+  let slotsLeft = Math.max(0, policy.maxMembers - liveTeammates)
   const pool = []
   for (const member of members.filter((candidate) => !isVirtualMember(candidate))) {
     const existing = reusable.get(member.name)
@@ -1335,7 +1373,7 @@ async function ensureFlowPool(ctx, agentTeams, lead, members, notes, signal) {
       continue
     }
     if (slotsLeft <= 0) {
-      notes.push(`智能体槽位不足（设置上限 ${policy.maxMembers}，已用 ${teammates.length}），无法新建 worker ${member.name}；请复用已有成员名或调大上限`)
+      notes.push(`智能体槽位不足（设置上限 ${policy.maxMembers}，已用 ${liveTeammates}），无法新建 worker ${member.name}；请复用已有成员名或调大上限`)
       continue
     }
     const spawnName = uniqueMemberName(member.name, roster)
@@ -1567,6 +1605,11 @@ function apply(ctx) {
       const roster = await agentTeams.listMembers(lead)
       const teammatesBefore = roster.filter((row) => row.role !== 'lead')
       const reusableByName = new Map(teammatesBefore.filter((row) => row.status !== 'failed').map((row) => [row.name, row]))
+      // 历史成员仍可冷唤醒复用，但不占新的并发容量；容量只按仍在线的成员算。
+      const liveBefore =
+        typeof agentTeams.liveMembers === 'function'
+          ? (await agentTeams.liveMembers(lead)).length
+          : teammatesBefore.length
       const notes = []
       const advisor = aestheticMember(config)
       const override = args.members === undefined ? undefined : normalizeMemberOverride(args.members)
@@ -1588,7 +1631,7 @@ function apply(ctx) {
       const members = [...realMembers, ...virtualMembers]
       let planItems = []
       const skipped = []
-      let slotsLeft = Math.max(0, policy.maxMembers - teammatesBefore.length)
+      let slotsLeft = Math.max(0, policy.maxMembers - liveBefore)
       const usedReuseNames = new Set()
       for (const [index, member] of members.entries()) {
         if (isVirtualMember(member)) {
@@ -1608,14 +1651,14 @@ function apply(ctx) {
           skipped.push({
             name: member.name,
             model: member.model,
-            reason: `没有空余智能体槽位（设置上限 ${policy.maxMembers}，已用 ${teammatesBefore.length}）；新开一个对话即可重置槽位`,
+            reason: `没有空余智能体槽位（设置上限 ${policy.maxMembers}，已用 ${liveBefore}）；新开一个对话即可重置槽位`,
           })
         }
       }
       if (planItems.length === 0) {
         const reusableNames = [...reusableByName.keys()]
         throw new Error(
-          `没有可用的智能体槽位：设置上限 ${policy.maxMembers}，当前已用 ${teammatesBefore.length}。请到设置里调大智能体上限（或删掉一些 teammate），或使用已有成员：${reusableNames.length > 0 ? reusableNames.join(', ') : '（无）'}；新开一个对话也可以重置槽位`,
+          `没有可用的智能体槽位：设置上限 ${policy.maxMembers}，当前已用 ${liveBefore}。请到设置里调大智能体上限（或删掉一些 teammate），或使用已有成员：${reusableNames.length > 0 ? reusableNames.join(', ') : '（无）'}；新开一个对话也可以重置槽位`,
         )
       }
       if (skipped.length > 0) notes.push(`${skipped.length} 个成员因槽位不足被跳过：${skipped.map((row) => row.name).join(', ')}`)
@@ -1954,7 +1997,7 @@ function apply(ctx) {
         team: {
           maxMembers: policy.maxMembers,
           limitSource: policy.source,
-          usedBefore: teammatesBefore.length,
+          usedBefore: liveBefore,
           reused: membersOut.filter((member) => member.reused === true).length,
           skipped,
           virtualMembers: virtualMembers.map((member) => ({
